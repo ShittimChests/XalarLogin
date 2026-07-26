@@ -1,8 +1,8 @@
 # ============ XalarLogin 配置 ============
 #
-# 安全提示：Paper 默认会把玩家执行的命令原文写进 logs/latest.log，
-# 也就是说 /reg 和 /a 的密码会明文落盘。该日志早于插件事件触发，
-# 插件无法拦截 —— 请把服务器根目录 spigot.yml 里的 commands.log 改为 false。
+# 安全提示：Paper 默认会把玩家执行的命令原文写进 logs/latest.log，也就是说
+# /reg、/a、/changepw、/xalar passwd 的密码都会明文落盘。该日志早于插件事件
+# 触发，插件无法拦截 —— 请把服务器根目录 spigot.yml 里的 commands.log 改为 false。
 
 # ---------------- 存储后端 ----------------
 # 两种后端的 JDBC 驱动都由 Paper 服务端自带，切换不需要装任何东西。
@@ -24,21 +24,33 @@ storage:
     password: ''
     # 表名，插件会自动创建。多个服务器想各用各的账号时改这里区分
     table: accounts
-    # 追加到 JDBC URL 的参数，一般不用动
-    properties: 'useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=utf8&serverTimezone=UTC'
+    # 追加到 JDBC URL 的参数，一般不用动。
+    # 默认 sslMode=PREFERRED：数据库支持 TLS 就加密，不支持则回退明文。
+    # 不要改成 useSSL=false + allowPublicKeyRetrieval=true —— MySQL 8 默认的
+    # caching_sha2_password 下，这个组合允许中间人塞入自己的 RSA 公钥并还原出
+    # 你的数据库密码。数据库和服务端不在同一台机器上时尤其危险。
+    # autoDeserialize / allowLoadLocalInfile / allowUrlInLocalInfile /
+    # allowMultiQueries / databaseTerm 会被插件直接拒绝，见启动日志。
+    properties: 'sslMode=PREFERRED&characterEncoding=utf8&serverTimezone=UTC'
 
 # ---------------- 认证行为 ----------------
 
 # 登录超时（秒）：加入服务器后超过此时间未注册/登录将被踢出
 login-timeout-seconds: 60
 
-# 密码连续错误达到此次数将被踢出服务器
+# 密码连续错误达到此次数将被踢出服务器，并锁定该玩家名
 max-login-attempts: 3
 
-# 被踢出后的锁定时长（秒）：这段时间内该玩家名与该 IP 无法再进服尝试。
+# 被踢出后的锁定时长（秒）：这段时间内被锁定的玩家名 / IP 无法再进服尝试。
 # 失败次数按玩家名和来源 IP 分别累计，重连不会清零，用于挡住反复重连爆破。
 # 设为 0 表示不锁定（踢出后可立即重连再试，不推荐）
 lockout-seconds: 300
+
+# IP 维度的锁定阈值 = max-login-attempts × 这个倍数（默认 3 × 5 = 15 次）。
+# 之所以比玩家名宽这么多：宿舍、家庭 NAT、运营商 CGNAT 后面几十个玩家共用一个
+# 出口 IP，两个维度用同一个阈值的话，一个人输错三次就会把所有人一起锁在门外。
+# 设为 0 表示只按玩家名锁定，完全不按 IP 锁定
+ip-lockout-factor: 5
 
 # 密码最小长度
 min-password-length: 6
@@ -47,12 +59,17 @@ min-password-length: 6
 remind-interval-seconds: 5
 
 # 同 IP 免密登录：用密码成功登录一次后，下次从相同 IP 进服自动登录；
-# IP 变化或修改过密码则需重新输入密码。设为 false 关闭此功能
-ip-session-enabled: true
+# IP 变化或修改过密码则需重新输入密码。
+#
+# ⚠️ 默认关闭，开启前务必想清楚：离线模式下任何人都能用别人的名字进服，
+# 而这个功能只比对出口 IP。宿舍、家庭 NAT、运营商 CGNAT、同一个 VPN 出口
+# 后面的人因此可以互相顶号，完全不需要密码，也完全绕过失败锁定。
+# 只有在你确信每个玩家都有独立公网 IP 时才建议开启
+ip-session-enabled: false
 
 # 密码哈希 PBKDF2 迭代次数，越高越难爆破但登录越慢（60 万约需 0.2 秒）。
-# 低于 10 万会被自动抬回 10 万。调整后老账号仍按注册时的迭代次数校验，
-# 只有新注册和改密码才会用上新值，不会导致任何人登录不了
+# 有效范围 10 万 ~ 1000 万，超出会被自动钳到边界。调整后老账号仍按注册时的
+# 迭代次数校验，只有新注册和改密码才会用上新值，不会导致任何人登录不了
 password-hash-iterations: 600000
 
 # 所有消息文案，支持 & 颜色代码

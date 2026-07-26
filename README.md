@@ -45,7 +45,7 @@
 ### 注意事项
 
 - 进服后 **60 秒内**未注册/登录会被踢出，重新进服即可
-- 密码输错 **3 次**会被踢出，并且 **5 分钟内无法再进服尝试**（重连不会重置次数）
+- 密码输错 **3 次**会被踢出，并且 **5 分钟内无法再用这个名字进服**（重连不会重置次数）
 - 忘记密码请联系管理员重置账号
 
 ---
@@ -72,6 +72,8 @@ Paper 会把玩家执行的每条命令原文写进 `logs/latest.log` 和控制�
 **插件无法拦截这条日志** —— 服务端写日志的时机早于插件事件触发（`SpigotConfig.logCommands`
 的判断在 `PlayerCommandPreprocessEvent` 构造之前），取消事件也来不及。日志文件通常权限宽松、
 会被打包发给别人排障、可能被日志上报插件转发，等于密码直接泄露。
+
+四条带密码的命令全部受影响：`/reg`、`/a`、`/changepw`，以及管理员的 `/xalar passwd`。
 
 唯一的办法是在服务器根目录的 `spigot.yml` 里改：
 
@@ -121,7 +123,7 @@ storage:
     user: xalarlogin
     password: '你的密码'
     table: accounts           # 表名，插件会自动创建
-    properties: 'useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=utf8&serverTimezone=UTC'
+    properties: 'sslMode=PREFERRED&characterEncoding=utf8&serverTimezone=UTC'
 ```
 
 要点：
@@ -135,6 +137,12 @@ storage:
   表现成「所有人都没注册过」，比直接报错危险得多
 - 切换后端**不会自动迁移已有数据**。SQLite 的数据在 `plugins/XalarLogin/data.db`，
   需要迁移的话得自己把 `accounts` 表导过去
+- **`properties` 里不要关 TLS。** 默认的 `sslMode=PREFERRED` 表示数据库支持 TLS 就加密。
+  网上常见的 `useSSL=false&allowPublicKeyRetrieval=true` 千万别抄：MySQL 8 默认的
+  `caching_sha2_password` 认证下，这个组合允许中间人塞入自己的 RSA 公钥，从而还原出你的
+  数据库密码。数据库和服务端不在同一台机器上时尤其危险
+- 出于同样的理由，`autoDeserialize`、`allowLoadLocalInfile`、`allowUrlInLocalInfile`、
+  `allowMultiQueries`、`databaseTerm` 这几个参数会被插件直接拒绝并在启动时报错
 
 ### 配置项（config.yml）
 
@@ -143,30 +151,50 @@ storage:
 | `storage.type` | sqlite | 存储后端，`sqlite` 或 `mysql` |
 | `storage.mysql.*` | — | MySQL 连接信息，见上一节 |
 | `login-timeout-seconds` | 60 | 进服后多少秒未认证被踢出 |
-| `max-login-attempts` | 3 | 密码错误多少次被踢出并锁定 |
-| `lockout-seconds` | 300 | 被踢出后锁定多久，期间该玩家名与 IP 无法进服。设为 0 关闭锁定 |
+| `max-login-attempts` | 3 | 密码错误多少次被踢出并锁定该玩家名 |
+| `lockout-seconds` | 300 | 锁定时长（秒），期间被锁定的玩家名 / IP 无法进服。设为 0 关闭锁定 |
+| `ip-lockout-factor` | 5 | IP 维度的锁定阈值 = `max-login-attempts` × 此值。设为 0 表示不按 IP 锁定 |
 | `min-password-length` | 6 | 密码最小长度 |
 | `remind-interval-seconds` | 5 | 未登录时的提示间隔（秒） |
-| `ip-session-enabled` | true | 同 IP 免密登录开关 |
-| `password-hash-iterations` | 600000 | PBKDF2 迭代次数，越高越难爆破但登录越慢。低于 10 万会被抬回 10 万 |
+| `ip-session-enabled` | **false** | 同 IP 免密登录开关，默认关闭，开启前请读下方安全权衡 |
+| `password-hash-iterations` | 600000 | PBKDF2 迭代次数，越高越难爆破但登录越慢。有效范围 10 万 ~ 1000 万 |
 
 关于 `password-hash-iterations`：迭代次数会写进每条密码哈希里，所以**调整它不会让任何老账号失效** ——
 老密码继续按注册时的次数校验，只有新注册和改密码才会用上新值。60 万是 OWASP 对 PBKDF2-SHA256
-的建议值，单次校验约 0.2 秒（跑在异步线程，不卡主线程）。低配机器可以适当调低。
+的建议值，单次校验约 0.2 秒（跑在异步线程，不卡主线程）。低配机器可以适当调低。超出有效范围的
+配置会被自动钳到边界，不会写出校验不了的哈希。
 
 ### 防爆破
 
 密码错误次数按**玩家名**和**来源 IP** 分别累计，存在服务端内存里，**踢出后重连不会清零**。
-达到 `max-login-attempts` 后该玩家名和该 IP 会被锁定 `lockout-seconds` 秒，期间进服直接被踢。
-成功登录会立即清除记录。服务端重启后计数清空。
+成功登录会立即清除记录，服务端重启后计数清空。两个维度用**各自的阈值**：
+
+- 玩家名：错 `max-login-attempts` 次（默认 3）即锁定该名字
+- IP：错 `max-login-attempts × ip-lockout-factor` 次（默认 15）才锁定该地址
+
+IP 阈值之所以宽这么多，是因为宿舍、家庭 NAT、运营商 CGNAT 后面往往几十个玩家共用一个出口 IP。
+两个维度共用阈值的话，一个人手滑输错三次就会把同网络的所有人一起锁在门外五分钟。
+如果你的服务器面向一个封闭小圈子、不担心误伤，可以把 `ip-lockout-factor` 调小收紧。
+
+> 注意：离线模式下任何人都能用任意名字进服，所以**别人可以故意用你的名字连错密码来锁定你的账号**。
+> 这是玩家名维度锁定的固有代价（不按名字锁的话换个 IP 就绕过了）。遇到被针对的情况，
+> 管理员可以用 `/xalar passwd` 或 `/xalar unregister` 立即解除该玩家的锁定。
 
 所有玩家可见的文字都在 `messages` 段落里，支持 `&` 颜色代码，改完重启服务器生效。配置文件里缺少的项会自动使用插件内置默认值，升级后无需手动补条目。
 
 ### 关于同 IP 免密登录的安全权衡
 
-免密判断依据是「上次成功登录的 IP == 本次进服 IP」。在网吧、校园网、家庭合租等**多人共享同一出口 IP** 的环境下，同网络的其他人只要用相同玩家名进服就能免密顶号。玩家群体存在这类情况时，建议把 `ip-session-enabled` 设为 `false`。
+**这个功能默认关闭（`ip-session-enabled: false`），开启前请读完本节。**
 
-另外：修改密码会立即作废免密会话；管理员 `unregister` 会直接删号，两者都会强制下次输密码。
+免密判断依据只有一条：「上次成功登录的 IP == 本次进服 IP」。而离线模式下任何人都能用别人的
+名字进服。两者相加意味着——在网吧、校园网、宿舍、家庭合租、运营商 CGNAT、共用 VPN 出口等
+**多人共享同一出口 IP** 的环境里，同网络的其他人用你的名字进服就能直接顶号，不需要密码，
+而且完全绕过上面那套失败锁定。
+
+只有在你确信每个玩家都有独立公网 IP 时，才建议开启。
+
+另外：修改密码（`/changepw` 与 `/xalar passwd`）会立即作废免密会话；管理员 `unregister` 会直接删号，
+两者都会强制下次输密码。
 
 ### 数据说明
 

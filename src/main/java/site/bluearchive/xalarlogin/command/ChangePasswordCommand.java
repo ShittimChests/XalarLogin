@@ -62,9 +62,12 @@ public final class ChangePasswordCommand implements CommandExecutor {
             if (storedHash == null || !PasswordHasher.verify(oldPassword, storedHash)) {
                 plugin.getServer().getScheduler().runTask(plugin, () -> {
                     session.busy.set(false);
-                    if (player.isOnline()) {
-                        player.sendMessage(plugin.message("changepw-wrong-old"));
+                    // 和下面的成功分支一样比对会话实例：玩家退服重连后 map 里已是新会话，
+                    // 给它发上一次连接的「旧密码错误」是误导
+                    if (plugin.sessions().get(uuid) != session || !player.isOnline()) {
+                        return;
                     }
+                    player.sendMessage(plugin.message("changepw-wrong-old"));
                 });
                 return;
             }

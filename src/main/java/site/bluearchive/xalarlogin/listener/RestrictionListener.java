@@ -1,5 +1,7 @@
 package site.bluearchive.xalarlogin.listener;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.sql.SQLException;
 import java.util.HashSet;
 import java.util.List;
@@ -26,11 +28,13 @@ import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerEditBookEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerSwapHandItemsEvent;
 
+import site.bluearchive.xalarlogin.LoginThrottle;
 import site.bluearchive.xalarlogin.SessionManager.Phase;
 import site.bluearchive.xalarlogin.SessionManager.Session;
 import site.bluearchive.xalarlogin.XalarLoginPlugin;
@@ -71,6 +75,28 @@ public final class RestrictionListener implements Listener {
 
     // ---------- 会话生命周期 ----------
 
+    /**
+     * 被锁定的来源在这里就挡掉，而不是等 Join 之后再踢：到了 Join 玩家已经进了世界，
+     * 区块加载、进服广播、其他插件的 Join 逻辑都已经跑过一轮，反复重连即可放大这份开销。
+     *
+     * <p>这是全插件唯一跑在异步线程的事件处理器，因此只做两件线程安全的事：读
+     * {@link LoginThrottle}（ConcurrentHashMap，纯读）和读配置（onEnable 时已在主线程加载完）。
+     * <b>不要在这里碰 Session</b>——此时 Player 对象还不存在，会话要等 Join 才建立。
+     * 用 AsyncPlayerPreLoginEvent 而不是 PlayerLoginEvent，是因为后者在 Paper 26.2 已废弃。
+     */
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onPreLogin(AsyncPlayerPreLoginEvent event) {
+        if (event.getLoginResult() != AsyncPlayerPreLoginEvent.Result.ALLOWED) {
+            return;
+        }
+        long lockedFor = plugin.throttle().remainingLockSeconds(
+                event.getName(), event.getAddress().getHostAddress(), System.currentTimeMillis());
+        if (lockedFor > 0) {
+            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                    plugin.bareMessage("kick-locked-out", "{seconds}", String.valueOf(lockedFor)));
+        }
+    }
+
     @EventHandler(priority = EventPriority.LOWEST)
     public void onJoin(PlayerJoinEvent event) {
         initializePlayer(event.getPlayer());
@@ -81,19 +107,16 @@ public final class RestrictionListener implements Listener {
         plugin.sessions().remove(event.getPlayer().getUniqueId());
     }
 
-    /** 建立会话并异步加载账号数据；同 IP 免密直接放行，否则开始提示与超时计时。 */
+    /** 建立会话并异步加载账号数据；同 IP 免密直接放行，否则开始提示计时。 */
     public void initializePlayer(Player player) {
         UUID uuid = player.getUniqueId();
         String name = player.getName();
         String currentIp = playerIp(player);
 
-        long lockedFor = plugin.throttle().remainingLockSeconds(name, currentIp, System.currentTimeMillis());
-        if (lockedFor > 0) {
-            player.kick(plugin.bareMessage("kick-locked-out", "{seconds}", String.valueOf(lockedFor)));
-            return;
-        }
-
         Session session = plugin.sessions().create(uuid);
+        // 超时任务从建立会话就挂上，而不是等 phase 确定：数据库卡住时会话会一直停在
+        // LOADING，等到 startReminder 才计时的话玩家会被无限期冻结在原地没人管。
+        startTimeout(player, session);
 
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             Database.Account account;
@@ -117,12 +140,14 @@ public final class RestrictionListener implements Listener {
                 }
                 if (account == null) {
                     session.phase = Phase.NEED_REGISTER;
-                    startAuthTasks(player, session);
+                    startReminder(player, session);
                     return;
                 }
                 session.passwordHash = account.passwordHash();
 
-                boolean ipSessionEnabled = plugin.getConfig().getBoolean("ip-session-enabled", true);
+                // 默认关闭：离线模式下谁都能用别人的名字进服，只要出口 IP 相同就免密放行，
+                // 等于 NAT / CGNAT 后面的人可以互相顶号，而且完全绕过 LoginThrottle。
+                boolean ipSessionEnabled = plugin.getConfig().getBoolean("ip-session-enabled", false);
                 if (ipSessionEnabled && currentIp != null && currentIp.equals(account.lastIp())) {
                     plugin.sessions().markLoggedIn(player);
                     plugin.throttle().clear(name, currentIp);
@@ -137,20 +162,32 @@ public final class RestrictionListener implements Listener {
                     return;
                 }
                 session.phase = Phase.NEED_LOGIN;
-                startAuthTasks(player, session);
+                startReminder(player, session);
             });
         });
     }
 
-    /** @return 玩家来源 IP，取不到（极端情况）返回 null，此时不启用免密 */
+    /** @return 玩家来源 IP，取不到（极端情况）返回 null，此时该玩家不参与免密与 IP 节流 */
     public static String playerIp(Player player) {
-        return player.getAddress() != null ? player.getAddress().getAddress().getHostAddress() : null;
+        InetSocketAddress socket = player.getAddress();
+        // 两层都要判空：SocketAddress 本身可能没有，它内部的 InetAddress 在地址未解析时也是 null
+        InetAddress address = socket == null ? null : socket.getAddress();
+        return address == null ? null : address.getHostAddress();
     }
 
-    private void startAuthTasks(Player player, Session session) {
-        long remindTicks = Math.max(1, plugin.getConfig().getInt("remind-interval-seconds", 5)) * 20L;
+    /** 认证超时兜底。免密放行与登录成功都会经 markLoggedIn 取消它。 */
+    private void startTimeout(Player player, Session session) {
         long timeoutTicks = Math.max(5, plugin.getConfig().getInt("login-timeout-seconds", 60)) * 20L;
+        session.timeoutTask = plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
+            if (player.isOnline() && !plugin.sessions().isLoggedIn(player.getUniqueId())) {
+                player.kick(plugin.bareMessage("kick-timeout"));
+            }
+        }, timeoutTicks);
+    }
 
+    /** phase 定下来之后才开始催——LOADING 期间玩家还不知道该 /reg 还是 /a。 */
+    private void startReminder(Player player, Session session) {
+        long remindTicks = Math.max(1, plugin.getConfig().getInt("remind-interval-seconds", 5)) * 20L;
         session.remindTask = plugin.getServer().getScheduler().runTaskTimer(plugin, () -> {
             Session current = plugin.sessions().get(player.getUniqueId());
             if (current == null || current.phase == Phase.LOGGED_IN) {
@@ -159,12 +196,6 @@ public final class RestrictionListener implements Listener {
             String key = current.phase == Phase.NEED_REGISTER ? "remind-register" : "remind-login";
             player.sendMessage(plugin.message(key));
         }, 1L, remindTicks);
-
-        session.timeoutTask = plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
-            if (player.isOnline() && !plugin.sessions().isLoggedIn(player.getUniqueId())) {
-                player.kick(plugin.bareMessage("kick-timeout"));
-            }
-        }, timeoutTicks);
     }
 
     private boolean isRestricted(Player player) {

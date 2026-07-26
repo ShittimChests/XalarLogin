@@ -20,8 +20,12 @@ public final class PasswordHasher {
     public static final int MIN_ITERATIONS = 100_000;
     /** OWASP 对 PBKDF2-HMAC-SHA256 的建议值 */
     public static final int DEFAULT_ITERATIONS = 600_000;
-    /** 校验时接受的迭代数上限，挡住数据库里的异常值 */
-    private static final int MAX_VERIFY_ITERATIONS = 10_000_000;
+    /**
+     * 迭代数上限。{@link #hash} 与 {@link #verify} 必须用同一个上限：
+     * 只在 verify 侧设限的话，配置里多打一个 0 就会写出 verify 永远拒绝的哈希，
+     * 表现成「注册成功了但密码永远错」，而且改密和管理员重设都会落进同一个坑。
+     */
+    public static final int MAX_ITERATIONS = 10_000_000;
 
     private static final int KEY_LENGTH_BITS = 256;
     private static final int SALT_BYTES = 16;
@@ -35,12 +39,17 @@ public final class PasswordHasher {
      * 老密码继续按注册时的迭代数校验，重新注册或改密码才会用上新值。
      */
     public static String hash(String password, int iterations) {
-        int effective = Math.max(MIN_ITERATIONS, iterations);
+        int effective = clampIterations(iterations);
         byte[] salt = new byte[SALT_BYTES];
         RANDOM.nextBytes(salt);
         byte[] hash = pbkdf2(password.toCharArray(), salt, effective);
         Base64.Encoder encoder = Base64.getEncoder();
         return effective + ":" + encoder.encodeToString(salt) + ":" + encoder.encodeToString(hash);
+    }
+
+    /** 把配置里的迭代数收进 {@code [MIN_ITERATIONS, MAX_ITERATIONS]}。 */
+    public static int clampIterations(int iterations) {
+        return Math.min(MAX_ITERATIONS, Math.max(MIN_ITERATIONS, iterations));
     }
 
     public static boolean verify(String password, String stored) {
@@ -51,7 +60,7 @@ public final class PasswordHasher {
             }
             int iterations = Integer.parseInt(parts[0]);
             // 迭代数来自数据库，损坏或被篡改的值会让校验线程空转很久
-            if (iterations < 1 || iterations > MAX_VERIFY_ITERATIONS) {
+            if (iterations < 1 || iterations > MAX_ITERATIONS) {
                 return false;
             }
             byte[] salt = Base64.getDecoder().decode(parts[1]);

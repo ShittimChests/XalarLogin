@@ -2,11 +2,14 @@ package site.bluearchive.xalarlogin.storage;
 
 import java.io.File;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -19,6 +22,12 @@ import org.bukkit.configuration.ConfigurationSection;
  * <p>单连接 + {@code synchronized}：查询量很小（进服查一次、登录写一次），
  * 串行化不构成瓶颈，省掉连接池依赖。MySQL 的连接会被服务端 {@code wait_timeout}
  * 掐断，所以每个操作都包在 {@link #execute} 里，失败时验一次连接并重连重试。
+ *
+ * <p><b>上层依赖这里的串行化，换连接池之前必须先补会话级校验。</b>
+ * 例：玩家进服时的 {@code findAccount} 与管理员 {@code /xalar passwd} 的
+ * {@code updatePasswordByName} 之间存在读改覆盖的窗口——进服回调会把查库那一刻的旧哈希、
+ * 旧 last_ip 无条件写回会话。现在这个窗口跑不出来，因为单连接保证了 UPDATE 必然排在
+ * SELECT 之后返回、对应的主线程回调也必然落在更后面的 tick。一旦并发化，这个不变式就没了。
  */
 public final class Database implements AutoCloseable {
 
@@ -29,6 +38,17 @@ public final class Database implements AutoCloseable {
     /** 表名会直接拼进 SQL，只允许标识符字符 */
     private static final Pattern SAFE_TABLE = Pattern.compile("[A-Za-z0-9_]{1,64}");
     private static final String DEFAULT_TABLE = "accounts";
+
+    /**
+     * 禁止出现在 storage.mysql.properties 里的 Connector/J 参数。
+     *
+     * <p>前四个会把「连到恶意或被劫持的 MySQL」升级成服务端上的任意文件读取或反序列化执行，
+     * 而这个插件一个都用不到。{@code databaseTerm} 则会让 {@code getCatalog()} 返回 null，
+     * 使 {@link #migrateAddLastIp} 的列检测永远判为「缺列」，启动时 ALTER 撞重复列直接停用插件。
+     */
+    private static final Set<String> BANNED_PROPERTIES = Set.of(
+            "autodeserialize", "allowloadlocalinfile", "allowurlinlocalinfile",
+            "allowmultiqueries", "databaseterm");
 
     @FunctionalInterface
     private interface SqlAction<T> {
@@ -92,10 +112,22 @@ public final class Database implements AutoCloseable {
             throw new SQLException("storage.mysql.table 只能包含字母、数字和下划线，当前配置为: " + table);
         }
         String properties = mysql.getString("properties", "");
+        checkProperties(properties);
         String url = "jdbc:mysql://" + mysql.getString("host", "localhost")
                 + ":" + mysql.getInt("port", 3306) + "/" + database
                 + (properties.isBlank() ? "" : "?" + properties);
         return new Database(backend, url, mysql.getString("user", ""), mysql.getString("password", ""), table);
+    }
+
+    /** properties 是原样拼进 JDBC URL 的，先把已知会造成危害的参数挡掉。 */
+    private static void checkProperties(String properties) throws SQLException {
+        for (String pair : properties.split("&")) {
+            String key = pair.split("=", 2)[0].trim().toLowerCase(Locale.ROOT);
+            if (BANNED_PROPERTIES.contains(key)) {
+                throw new SQLException("storage.mysql.properties 里不允许出现 " + key
+                        + "，它会让插件在连到恶意数据库时受到攻击，或破坏建表迁移");
+            }
+        }
     }
 
     public Backend backend() {
@@ -161,7 +193,12 @@ public final class Database implements AutoCloseable {
     /** 旧版本建的表没有 last_ip 列，补上。用 JDBC 元数据而非 PRAGMA，两种后端通用。 */
     private void migrateAddLastIp() throws SQLException {
         boolean hasLastIp = execute(conn -> {
-            try (ResultSet rs = conn.getMetaData().getColumns(conn.getCatalog(), null, table, "last_ip")) {
+            DatabaseMetaData meta = conn.getMetaData();
+            // getColumns 的表名和列名都是 LIKE pattern，'_' 是单字符通配符，
+            // 而表名允许下划线、列名本身就叫 last_ip，不转义会匹配到别的表/列上去
+            String escape = meta.getSearchStringEscape();
+            try (ResultSet rs = meta.getColumns(conn.getCatalog(), null,
+                    escapePattern(table, escape), escapePattern("last_ip", escape))) {
                 return rs.next();
             }
         });
@@ -173,6 +210,21 @@ public final class Database implements AutoCloseable {
                 return null;
             });
         }
+    }
+
+    /** 给 {@code getColumns} 之类的 pattern 参数转义 {@code _} 和 {@code %}。 */
+    private static String escapePattern(String value, String escape) {
+        if (escape == null || escape.isEmpty()) {
+            return value;
+        }
+        StringBuilder escaped = new StringBuilder(value.length() + 8);
+        for (char c : value.toCharArray()) {
+            if (c == '_' || c == '%' || escape.indexOf(c) >= 0) {
+                escaped.append(escape);
+            }
+            escaped.append(c);
+        }
+        return escaped.toString();
     }
 
     /** @return 账号数据，未注册返回 null */

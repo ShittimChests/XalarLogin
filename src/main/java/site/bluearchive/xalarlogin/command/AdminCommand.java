@@ -34,11 +34,11 @@ public final class AdminCommand implements TabExecutor {
     @Override
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command,
                              @NotNull String label, String @NotNull [] args) {
-        if (args.length >= 2 && args[0].equalsIgnoreCase("unregister") && args.length == 2) {
+        if (args.length == 2 && args[0].equalsIgnoreCase("unregister")) {
             handleUnregister(sender, args[1]);
             return true;
         }
-        if (args.length >= 2 && args[0].equalsIgnoreCase("passwd") && args.length == 3) {
+        if (args.length == 3 && args[0].equalsIgnoreCase("passwd")) {
             handlePasswd(sender, args[1], args[2]);
             return true;
         }
@@ -136,6 +136,8 @@ public final class AdminCommand implements TabExecutor {
             return SUBCOMMANDS.stream().filter(name -> name.startsWith(prefix)).toList();
         }
         if (args.length == 2 && SUBCOMMANDS.contains(args[0].toLowerCase(Locale.ROOT))) {
+            // 只补全在线玩家。两条命令都支持离线玩家，但补全离线名字要查库，
+            // 而 Tab 补全跑在主线程，不能为了这点便利引入一次同步 IO
             String prefix = args[1].toLowerCase(Locale.ROOT);
             return plugin.getServer().getOnlinePlayers().stream()
                     .map(Player::getName)

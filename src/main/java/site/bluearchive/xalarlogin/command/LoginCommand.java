@@ -9,6 +9,7 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
+import site.bluearchive.xalarlogin.LoginThrottle;
 import site.bluearchive.xalarlogin.PasswordHasher;
 import site.bluearchive.xalarlogin.SessionManager.Phase;
 import site.bluearchive.xalarlogin.SessionManager.Session;
@@ -101,17 +102,29 @@ public final class LoginCommand implements CommandExecutor {
     private void handleWrongPassword(Player player, String name, String ip) {
         int maxAttempts = Math.max(1, plugin.getConfig().getInt("max-login-attempts", 3));
         long lockoutSeconds = Math.max(0, plugin.getConfig().getLong("lockout-seconds", 300));
+        int ipFactor = Math.max(0, plugin.getConfig().getInt("ip-lockout-factor", 5));
         long now = System.currentTimeMillis();
         long retentionMillis = Math.max(lockoutSeconds, 60L) * 1000L;
 
-        int attempts = plugin.throttle().recordFailure(name, ip, now, retentionMillis);
-        if (attempts < maxAttempts) {
+        LoginThrottle.Failures failures = plugin.throttle().recordFailure(name, ip, now, retentionMillis);
+        boolean nameExceeded = failures.byName() >= maxAttempts;
+        // IP 维度用高得多的阈值：宿舍、家庭 NAT、运营商 CGNAT 后面几十个玩家共用一个出口 IP，
+        // 跟玩家名共用阈值的话，一个人输错三次就把所有人锁在门外五分钟。
+        boolean ipExceeded = ipFactor > 0 && failures.byIp() >= (long) maxAttempts * ipFactor;
+
+        if (!nameExceeded && !ipExceeded) {
             player.sendMessage(plugin.message("wrong-password",
-                    "{remaining}", String.valueOf(maxAttempts - attempts)));
+                    "{remaining}", String.valueOf(maxAttempts - failures.byName())));
             return;
         }
         if (lockoutSeconds > 0) {
-            plugin.throttle().lock(name, ip, now, lockoutSeconds * 1000L);
+            // 只锁真正越线的那个维度：被 IP 阈值兜住时不该连带把这个玩家名也锁上
+            if (nameExceeded) {
+                plugin.throttle().lockName(name, now, lockoutSeconds * 1000L);
+            }
+            if (ipExceeded) {
+                plugin.throttle().lockIp(ip, now, lockoutSeconds * 1000L);
+            }
             player.kick(plugin.bareMessage("kick-locked-out", "{seconds}", String.valueOf(lockoutSeconds)));
         } else {
             player.kick(plugin.bareMessage("kick-too-many-attempts"));

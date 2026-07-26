@@ -53,6 +53,11 @@ public enum Backend {
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""".formatted(table);
         }
 
+        // INSERT IGNORE 会把主键冲突之外的错误也降级成警告，语义比想要的宽。
+        // 但不能换成 INSERT ... ON DUPLICATE KEY UPDATE uuid = uuid：Connector/J 默认
+        // useAffectedRows=false，返回的是「匹配行数」而非「改动行数」，冲突时也返回非 0，
+        // register() 的「>0 即插入成功」就废了——玩家会被告知注册成功，实际库里还是旧密码。
+        // INSERT IGNORE 冲突时稳定返回 0，这个契约才是 register() 能依赖的。
         @Override
         String insertIgnoreInto() {
             return "INSERT IGNORE INTO ";

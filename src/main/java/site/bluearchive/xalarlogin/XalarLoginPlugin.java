@@ -81,7 +81,8 @@ public final class XalarLoginPlugin extends JavaPlugin {
     /**
      * Paper 在构造 PlayerCommandPreprocessEvent <b>之前</b> 就会把命令原文写进日志
      * （ServerGamePacketListenerImpl 里 SpigotConfig.logCommands 的判断早于事件触发），
-     * 所以插件无论怎么取消事件都拦不住 /reg、/a 的密码明文落盘，只能提醒管理员改服务端配置。
+     * 所以插件无论怎么取消事件都拦不住密码明文落盘，只能提醒管理员改服务端配置。
+     * 受影响的是全部四条带密码的命令：/reg、/a、/changepw、/xalar passwd。
      */
     private void warnIfCommandLoggingEnabled() {
         // getDataFolder() 是 plugins/XalarLogin，而且通常是相对路径，
@@ -97,8 +98,9 @@ public final class XalarLoginPlugin extends JavaPlugin {
         }
         getLogger().warning("=========================== 安全警告 ===========================");
         getLogger().warning(" spigot.yml 里 commands.log 为 true，服务端会把玩家执行的");
-        getLogger().warning(" 命令原文写入 logs/latest.log —— 这意味着 /reg 和 /a 的密码");
-        getLogger().warning(" 会以明文落盘。该日志早于插件事件触发，插件无法拦截。");
+        getLogger().warning(" 命令原文写入 logs/latest.log —— 这意味着 /reg、/a、/changepw");
+        getLogger().warning(" 和 /xalar passwd 的密码都会以明文落盘。");
+        getLogger().warning(" 该日志早于插件事件触发，插件无法拦截。");
         getLogger().warning(" 请把 spigot.yml 的 commands.log 改为 false 并重启服务器。");
         getLogger().warning("===============================================================");
     }
@@ -138,9 +140,10 @@ public final class XalarLoginPlugin extends JavaPlugin {
         return throttle;
     }
 
-    /** 密码哈希迭代次数，低于 PasswordHasher.MIN_ITERATIONS 的配置会被抬回下限。 */
+    /** 密码哈希迭代次数，越界的配置会被钳进 PasswordHasher 接受的区间。 */
     public int hashIterations() {
-        return getConfig().getInt("password-hash-iterations", PasswordHasher.DEFAULT_ITERATIONS);
+        return PasswordHasher.clampIterations(
+                getConfig().getInt("password-hash-iterations", PasswordHasher.DEFAULT_ITERATIONS));
     }
 
     /** 带前缀的聊天消息。replacements 形如 "{min}", "6" 成对出现。 */
