@@ -22,7 +22,9 @@ public final class Database implements AutoCloseable {
     private final Connection connection;
 
     public Database(File dataFolder) throws SQLException {
-        dataFolder.mkdirs();
+        if (!dataFolder.isDirectory() && !dataFolder.mkdirs()) {
+            throw new SQLException("无法创建数据目录: " + dataFolder.getAbsolutePath());
+        }
         try {
             Class.forName("org.sqlite.JDBC");
         } catch (ClassNotFoundException e) {
@@ -73,9 +75,16 @@ public final class Database implements AutoCloseable {
         }
     }
 
-    public synchronized void register(UUID uuid, String name, String passwordHash, String ip) throws SQLException {
+    /**
+     * 写入新账号。用 INSERT OR IGNORE 而不是裸 INSERT：玩家在注册的异步处理途中退服重连时，
+     * 新会话可能在这条 INSERT 落库前就查到「未注册」，之后再 /reg 就会撞主键冲突，
+     * 让账号既注册不了也登录不了。返回 false 让调用方能把玩家导向 /a 而不是报错。
+     *
+     * @return true 表示插入成功，false 表示该 UUID 已有账号
+     */
+    public synchronized boolean register(UUID uuid, String name, String passwordHash, String ip) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(
-                "INSERT INTO accounts (uuid, name, password_hash, registered_at, last_login, last_ip) VALUES (?, ?, ?, ?, ?, ?)")) {
+                "INSERT OR IGNORE INTO accounts (uuid, name, password_hash, registered_at, last_login, last_ip) VALUES (?, ?, ?, ?, ?, ?)")) {
             long now = System.currentTimeMillis();
             ps.setString(1, uuid.toString());
             ps.setString(2, name);
@@ -83,7 +92,7 @@ public final class Database implements AutoCloseable {
             ps.setLong(4, now);
             ps.setLong(5, now);
             ps.setString(6, ip);
-            ps.executeUpdate();
+            return ps.executeUpdate() > 0;
         }
     }
 
@@ -108,12 +117,19 @@ public final class Database implements AutoCloseable {
         }
     }
 
-    /** 按玩家名删除账号（不区分大小写）。@return 是否删除了记录 */
-    public synchronized boolean deleteByName(String name) throws SQLException {
+    /**
+     * 按玩家名删除账号（不区分大小写）。
+     *
+     * <p>离线模式的 UUID 由玩家名派生且区分大小写，所以 Steve 和 steve 是两个独立账号，
+     * 这条语句会一并删掉。返回条数而非布尔值，好让管理员从回显里看出误删了几个。
+     *
+     * @return 实际删除的记录数
+     */
+    public synchronized int deleteByName(String name) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(
                 "DELETE FROM accounts WHERE lower(name) = lower(?)")) {
             ps.setString(1, name);
-            return ps.executeUpdate() > 0;
+            return ps.executeUpdate();
         }
     }
 

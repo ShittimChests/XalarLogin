@@ -16,7 +16,13 @@ import javax.crypto.spec.PBEKeySpec;
  */
 public final class PasswordHasher {
 
-    private static final int ITERATIONS = 210_000;
+    /** 低于这个迭代数拒绝使用，防止配置写错把密码保护降到无意义的水平 */
+    public static final int MIN_ITERATIONS = 100_000;
+    /** OWASP 对 PBKDF2-HMAC-SHA256 的建议值 */
+    public static final int DEFAULT_ITERATIONS = 600_000;
+    /** 校验时接受的迭代数上限，挡住数据库里的异常值 */
+    private static final int MAX_VERIFY_ITERATIONS = 10_000_000;
+
     private static final int KEY_LENGTH_BITS = 256;
     private static final int SALT_BYTES = 16;
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -24,12 +30,17 @@ public final class PasswordHasher {
     private PasswordHasher() {
     }
 
-    public static String hash(String password) {
+    /**
+     * 迭代数写进哈希串本身，所以调高配置不会让老账号失效——
+     * 老密码继续按注册时的迭代数校验，重新注册或改密码才会用上新值。
+     */
+    public static String hash(String password, int iterations) {
+        int effective = Math.max(MIN_ITERATIONS, iterations);
         byte[] salt = new byte[SALT_BYTES];
         RANDOM.nextBytes(salt);
-        byte[] hash = pbkdf2(password.toCharArray(), salt, ITERATIONS);
+        byte[] hash = pbkdf2(password.toCharArray(), salt, effective);
         Base64.Encoder encoder = Base64.getEncoder();
-        return ITERATIONS + ":" + encoder.encodeToString(salt) + ":" + encoder.encodeToString(hash);
+        return effective + ":" + encoder.encodeToString(salt) + ":" + encoder.encodeToString(hash);
     }
 
     public static boolean verify(String password, String stored) {
@@ -39,6 +50,10 @@ public final class PasswordHasher {
                 return false;
             }
             int iterations = Integer.parseInt(parts[0]);
+            // 迭代数来自数据库，损坏或被篡改的值会让校验线程空转很久
+            if (iterations < 1 || iterations > MAX_VERIFY_ITERATIONS) {
+                return false;
+            }
             byte[] salt = Base64.getDecoder().decode(parts[1]);
             byte[] expected = Base64.getDecoder().decode(parts[2]);
             byte[] actual = pbkdf2(password.toCharArray(), salt, iterations);

@@ -1,10 +1,19 @@
 # ============ XalarLogin 配置 ============
+#
+# 安全提示：Paper 默认会把玩家执行的命令原文写进 logs/latest.log，
+# 也就是说 /reg 和 /a 的密码会明文落盘。该日志早于插件事件触发，
+# 插件无法拦截 —— 请把服务器根目录 spigot.yml 里的 commands.log 改为 false。
 
 # 登录超时（秒）：加入服务器后超过此时间未注册/登录将被踢出
 login-timeout-seconds: 60
 
 # 密码连续错误达到此次数将被踢出服务器
 max-login-attempts: 3
+
+# 被踢出后的锁定时长（秒）：这段时间内该玩家名与该 IP 无法再进服尝试。
+# 失败次数按玩家名和来源 IP 分别累计，重连不会清零，用于挡住反复重连爆破。
+# 设为 0 表示不锁定（踢出后可立即重连再试，不推荐）
+lockout-seconds: 300
 
 # 密码最小长度
 min-password-length: 6
@@ -16,8 +25,14 @@ remind-interval-seconds: 5
 # IP 变化或修改过密码则需重新输入密码。设为 false 关闭此功能
 ip-session-enabled: true
 
+# 密码哈希 PBKDF2 迭代次数，越高越难爆破但登录越慢（60 万约需 0.2 秒）。
+# 低于 10 万会被自动抬回 10 万。调整后老账号仍按注册时的迭代次数校验，
+# 只有新注册和改密码才会用上新值，不会导致任何人登录不了
+password-hash-iterations: 600000
+
 # 所有消息文案，支持 & 颜色代码
-# 可用占位符：{min} 最小密码长度、{remaining} 剩余尝试次数、{player} 玩家名
+# 可用占位符：{min} 最小密码长度、{remaining} 剩余尝试次数、{player} 玩家名、
+#             {seconds} 锁定剩余秒数、{count} 删除的记录数
 messages:
   prefix: '&7[&6XalarLogin&7] &r'
   remind-register: '&e请输入 &6/reg <密码> <重复密码> &e来注册账号，例：&6/reg 123456 123456'
@@ -29,6 +44,7 @@ messages:
   not-registered: '&c你还未注册，请先使用 &6/reg <密码> <重复密码> &c注册'
   already-logged-in: '&a你已经登录了'
   loading: '&e正在加载你的数据，请稍候再试'
+  processing: '&e正在处理你的上一条指令，请稍候'
   password-mismatch: '&c两次输入的密码不一致，请重新输入'
   password-too-short: '&c密码太短，至少需要 {min} 位'
   register-success: '&a注册成功，已自动登录，祝你游戏愉快！'
@@ -41,9 +57,10 @@ messages:
   db-error: '&c数据出错，请稍后重试或联系管理员'
   player-only: '&c该命令只能由玩家执行'
   admin-usage: '&c用法：/xalar unregister <玩家>'
-  admin-unregister-success: '&a已删除玩家 {player} 的账号'
+  admin-unregister-success: '&a已删除玩家 {player} 的账号记录（共 {count} 条）'
   admin-player-not-found: '&c未找到玩家 {player} 的账号记录'
   kick-too-many-attempts: '&c密码错误次数过多，请稍后再试'
+  kick-locked-out: '&c密码错误次数过多，请在 {seconds} 秒后再试'
   kick-timeout: '&c登录超时，请重新进入服务器'
   kick-db-error: '&c数据加载失败，请重新进入服务器'
   kick-unregistered: '&c你的账号已被管理员重置，请重新进服注册'

@@ -34,13 +34,21 @@ JAVA=~/tools/jdk-25.0.3+9/bin/java; $JAVA -Xmx2G -jar paper-26.2-*.jar --nogui <
 
 核心是一个以 `SessionManager.Phase` 为中心的状态机：`LOADING → NEED_REGISTER | NEED_LOGIN → LOGGED_IN`。
 
-- **`SessionManager`** — 每个在线玩家一个 `Session`：当前 phase、进服时从数据库缓存的 `passwordHash`（登录校验不再查库）、失败计数、提示/超时两个 `BukkitTask`。
-- **`listener/RestrictionListener`** — 两个职责：(1) 会话生命周期——`initializePlayer` 在 Join（及 onEnable 时遍历在线玩家，兼容 /reload）异步查库后置 phase 并启动提示/超时任务；若开启 `ip-session-enabled` 且进服 IP 等于库中 `last_ip`，直接 `markLoggedIn` 免密放行；(2) 冻结——对未 `LOGGED_IN` 玩家取消移动/聊天/命令/交互/破坏/伤害等事件。命令白名单 `ALLOWED_COMMANDS` 必须与 plugin.yml 里 reg/a 命令及其别名保持同步。
-- **`command/*`** — 四个命令类都遵循同一模式：主线程做参数与 phase 校验 → 异步线程做 PBKDF2 与 SQL → `runTask` 回主线程改状态、发消息。`RegisterCommand` 在异步处理期间把 phase 置回 `LOADING` 防止重复提交。
-- **`storage/Database`** — 单连接 SQLite，方法 `synchronized`；单表 `accounts`，主键为玩家 UUID，管理员删号按 name（不区分大小写），因为离线/在线模式 UUID 不同。`last_ip` 列记录最近成功登录 IP（注册/登录时写入，`updatePassword` 会清空它使免密会话作废）；加列用构造器里的 `PRAGMA table_info` 迁移模式，新增列请沿用。
-- **消息系统** — 所有文案在 `config.yml` 的 `messages.*`，`&` 颜色码经 `LegacyComponentSerializer.legacyAmpersand()` 转 Component。`XalarLoginPlugin.message()` 带前缀用于聊天，`bareMessage()` 无前缀用于踢出界面；占位符是成对变长参数 `("{min}", "6")`。新增消息务必同时加到 `config.yml`，缺 key 会显示「缺少消息配置」。
+- **`SessionManager`** — 每个在线玩家一个 `Session`：当前 phase、进服时从数据库缓存的 `passwordHash`（登录校验不再查库）、`busy` 抢占标志、提示/超时两个 `BukkitTask`。`create()` 返回它新建的实例本身，调用方要持有这个引用（见下方并发规则）。`markLoggedIn(Player)` 除了改 phase 还会 `player.updateCommands()`，把登录期间裁掉的补全列表还回去。
+- **`LoginThrottle`** — 跨会话的密码失败计数与锁定，按玩家名和来源 IP 各记一份取严。失败计数**不能**放回 `Session`：那样踢出后重连就清零，等于可以无限爆破。纯内存，重启清空。
+- **`listener/RestrictionListener`** — 两个职责：(1) 会话生命周期——`initializePlayer` 在 Join（及 onEnable 时遍历在线玩家，兼容 /reload）先查 `LoginThrottle` 锁定，再异步查库后置 phase 并启动提示/超时任务；若开启 `ip-session-enabled` 且进服 IP 等于库中 `last_ip`，直接 `markLoggedIn` 免密放行；(2) 冻结——对未 `LOGGED_IN` 玩家取消移动/聊天/命令/交互/破坏/伤害等事件。命令白名单由构造器从 `getCommand("reg"/"a")` 的名字与别名派生，改 plugin.yml 不需要再同步代码。
+- **`command/*`** — 四个命令类都遵循同一模式：主线程做参数与 phase 校验 → 异步线程做 PBKDF2 与 SQL → `runTask` 回主线程改状态、发消息。
+- **`storage/Database`** — 单连接 SQLite，方法 `synchronized`；单表 `accounts`，主键为玩家 UUID，管理员删号按 name（不区分大小写），因为离线/在线模式 UUID 不同。`register()` 用 `INSERT OR IGNORE` 并返回是否真的插入了——玩家在注册途中退服重连会让新会话查到「未注册」，裸 `INSERT` 之后会撞主键冲突把账号卡死。`last_ip` 列记录最近成功登录 IP（注册/登录时写入，`updatePassword` 会清空它使免密会话作废）；加列用构造器里的 `PRAGMA table_info` 迁移模式，新增列请沿用。
+- **消息系统** — 所有文案在 `config.yml` 的 `messages.*`，`&` 颜色码经 `LegacyComponentSerializer.legacyAmpersand()` 转 Component。`XalarLoginPlugin.message()` 带前缀用于聊天，`bareMessage()` 无前缀用于踢出界面；占位符是成对变长参数 `("{min}", "6")`。**替换发生在反序列化之后**（`render()` 用 `Component.replaceText`），这样占位符的值是纯文本——先拼字符串再整体反序列化会让玩家名里的 `&` 变成颜色码。新增消息务必同时加到 `config.yml`，缺 key 会显示「缺少消息配置」。
+- **密码哈希** — `PasswordHasher.hash(password, iterations)`，迭代数写进哈希串前缀，所以调 `password-hash-iterations` 不会让老账号失效。
 
-## 线程规则（改动时必须遵守）
+## 线程与并发规则（改动时必须遵守）
 
-- PBKDF2（约几十毫秒/次，故意的）和一切 SQL 只能在异步线程跑；`Session` 状态变更、`player.kick()`、事件处理只能在主线程。
-- 异步回调回到主线程后必须重新拿 Session 并检查 `player.isOnline()` 与当前 phase——玩家可能已退服或状态已变。
+- PBKDF2（默认 60 万迭代，约 0.2 秒/次，故意的）和一切 SQL 只能在异步线程跑；`Session` 状态变更、`player.kick()`、事件处理只能在主线程。
+- **任何会派发 PBKDF2/SQL 的命令都必须先 `session.busy.compareAndSet(false, true)` 抢占**，并在主线程回调里 `set(false)` 释放。没有这把锁，玩家连发命令就能同时排进 N 次 PBKDF2 打满异步线程池，还能在失败计数生效前并发试出远超上限的密码。
+- 异步回调回到主线程后，用 **`plugin.sessions().get(uuid) != session`** 比对会话实例，而不是只看 phase。玩家退服重连后 map 里换成了新会话，它同样处于 `LOADING`，光看 phase 会把上一次连接的数据用到这次身上。同时仍要检查 `player.isOnline()` 与当前 phase。
+- 事件处理器一律 `EventPriority.LOWEST`（退服清理用 `MONITOR`）：认证判定必须早于第三方插件，它们大多不看事件是否被取消。
+
+## 已知的、插件修不了的问题
+
+Paper 在构造 `PlayerCommandPreprocessEvent` **之前**就把命令原文写进日志（`ServerGamePacketListenerImpl` 里 `SpigotConfig.logCommands` 的判断早于事件），所以 `/reg`、`/a` 的密码必然明文落盘，取消事件也拦不住。唯一办法是把 `spigot.yml` 的 `commands.log` 设为 `false`；`onEnable` 里的 `warnIfCommandLoggingEnabled()` 会在没改的时候打警告。不要试图用插件代码「修复」它。

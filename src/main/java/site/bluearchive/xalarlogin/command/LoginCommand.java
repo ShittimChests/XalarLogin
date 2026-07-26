@@ -15,7 +15,7 @@ import site.bluearchive.xalarlogin.SessionManager.Session;
 import site.bluearchive.xalarlogin.XalarLoginPlugin;
 import site.bluearchive.xalarlogin.listener.RestrictionListener;
 
-/** /a <密码> */
+/** /a &lt;密码&gt; */
 public final class LoginCommand implements CommandExecutor {
 
     private final XalarLoginPlugin plugin;
@@ -55,9 +55,17 @@ public final class LoginCommand implements CommandExecutor {
             player.sendMessage(plugin.message("login-usage"));
             return true;
         }
+        // 抢占放在参数校验之后：用法错误不该占住这把锁。
+        // 没有它的话，连发 N 条 /a 会同时排进 N 次 PBKDF2，既能打满异步线程池，
+        // 又能在失败计数（只在回调里递增）生效之前并发试出远超上限的密码。
+        if (!session.busy.compareAndSet(false, true)) {
+            player.sendMessage(plugin.message("processing"));
+            return true;
+        }
 
         String storedHash = session.passwordHash;
         UUID uuid = player.getUniqueId();
+        String name = player.getName();
         String password = args[0];
         String ip = RestrictionListener.playerIp(player);
 
@@ -65,32 +73,48 @@ public final class LoginCommand implements CommandExecutor {
             boolean ok = storedHash != null && PasswordHasher.verify(password, storedHash);
 
             plugin.getServer().getScheduler().runTask(plugin, () -> {
-                Session current = plugin.sessions().get(uuid);
-                if (current == null || !player.isOnline() || current.phase != Phase.NEED_LOGIN) {
+                session.busy.set(false);
+                if (plugin.sessions().get(uuid) != session || !player.isOnline()
+                        || session.phase != Phase.NEED_LOGIN) {
                     return;
                 }
                 if (ok) {
-                    plugin.sessions().markLoggedIn(uuid);
+                    plugin.sessions().markLoggedIn(player);
+                    plugin.throttle().clear(name, ip);
                     player.sendMessage(plugin.message("login-success"));
                     plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
                         try {
                             plugin.database().updateLastLogin(uuid, ip);
                         } catch (SQLException e) {
-                            plugin.getLogger().warning("更新玩家 " + player.getName() + " 登录时间失败: " + e.getMessage());
+                            plugin.getLogger().warning("更新玩家 " + name + " 登录时间失败: " + e.getMessage());
                         }
                     });
                     return;
                 }
-                int maxAttempts = plugin.getConfig().getInt("max-login-attempts", 3);
-                int attempts = current.failedAttempts.incrementAndGet();
-                if (attempts >= maxAttempts) {
-                    player.kick(plugin.bareMessage("kick-too-many-attempts"));
-                } else {
-                    player.sendMessage(plugin.message("wrong-password",
-                            "{remaining}", String.valueOf(maxAttempts - attempts)));
-                }
+                handleWrongPassword(player, name, ip);
             });
         });
         return true;
+    }
+
+    /** 失败计数记在 LoginThrottle 而非 Session 上，这样踢出后重连也不会清零。 */
+    private void handleWrongPassword(Player player, String name, String ip) {
+        int maxAttempts = Math.max(1, plugin.getConfig().getInt("max-login-attempts", 3));
+        long lockoutSeconds = Math.max(0, plugin.getConfig().getLong("lockout-seconds", 300));
+        long now = System.currentTimeMillis();
+        long retentionMillis = Math.max(lockoutSeconds, 60L) * 1000L;
+
+        int attempts = plugin.throttle().recordFailure(name, ip, now, retentionMillis);
+        if (attempts < maxAttempts) {
+            player.sendMessage(plugin.message("wrong-password",
+                    "{remaining}", String.valueOf(maxAttempts - attempts)));
+            return;
+        }
+        if (lockoutSeconds > 0) {
+            plugin.throttle().lock(name, ip, now, lockoutSeconds * 1000L);
+            player.kick(plugin.bareMessage("kick-locked-out", "{seconds}", String.valueOf(lockoutSeconds)));
+        } else {
+            player.kick(plugin.bareMessage("kick-too-many-attempts"));
+        }
     }
 }

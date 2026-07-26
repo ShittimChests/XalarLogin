@@ -14,7 +14,7 @@ import site.bluearchive.xalarlogin.SessionManager.Phase;
 import site.bluearchive.xalarlogin.SessionManager.Session;
 import site.bluearchive.xalarlogin.XalarLoginPlugin;
 
-/** /changepw <旧密码> <新密码> */
+/** /changepw &lt;旧密码&gt; &lt;新密码&gt; */
 public final class ChangePasswordCommand implements CommandExecutor {
 
     private final XalarLoginPlugin plugin;
@@ -44,38 +44,47 @@ public final class ChangePasswordCommand implements CommandExecutor {
             player.sendMessage(plugin.message("password-too-short", "{min}", String.valueOf(minLength)));
             return true;
         }
+        // 没有这把锁的话，连发两条改密命令会各自拿同一份旧哈希校验通过、各自写库，
+        // 最后数据库留下后写入的那个、会话缓存留下后回调的那个，两者可能对不上。
+        if (!session.busy.compareAndSet(false, true)) {
+            player.sendMessage(plugin.message("processing"));
+            return true;
+        }
 
         UUID uuid = player.getUniqueId();
+        String name = player.getName();
         String oldPassword = args[0];
         String newPassword = args[1];
         String storedHash = session.passwordHash;
+        int iterations = plugin.hashIterations();
 
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             if (storedHash == null || !PasswordHasher.verify(oldPassword, storedHash)) {
                 plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    session.busy.set(false);
                     if (player.isOnline()) {
                         player.sendMessage(plugin.message("changepw-wrong-old"));
                     }
                 });
                 return;
             }
-            String newHash = PasswordHasher.hash(newPassword);
+            String newHash = PasswordHasher.hash(newPassword, iterations);
             boolean saved = true;
             try {
                 plugin.database().updatePassword(uuid, newHash);
             } catch (SQLException e) {
                 saved = false;
-                plugin.getLogger().severe("修改玩家 " + player.getName() + " 密码失败: " + e.getMessage());
+                plugin.getLogger().severe("修改玩家 " + name + " 密码失败: " + e.getMessage());
             }
             final boolean ok = saved;
 
             plugin.getServer().getScheduler().runTask(plugin, () -> {
-                Session current = plugin.sessions().get(uuid);
-                if (current == null || !player.isOnline()) {
+                session.busy.set(false);
+                if (plugin.sessions().get(uuid) != session || !player.isOnline()) {
                     return;
                 }
                 if (ok) {
-                    current.passwordHash = newHash;
+                    session.passwordHash = newHash;
                     player.sendMessage(plugin.message("changepw-success"));
                 } else {
                     player.sendMessage(plugin.message("db-error"));
