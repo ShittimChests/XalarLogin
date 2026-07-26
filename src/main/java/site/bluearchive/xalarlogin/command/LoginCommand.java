@@ -104,6 +104,9 @@ public final class LoginCommand implements CommandExecutor {
         long lockoutSeconds = Math.max(0, plugin.getConfig().getLong("lockout-seconds", 300));
         int ipFactor = Math.max(0, plugin.getConfig().getInt("ip-lockout-factor", 5));
         long now = System.currentTimeMillis();
+        // 保留期只负责「一轮没打满就长时间没动静，当作新的一轮」。锁定到期后的归零不靠它，
+        // 由 LoginThrottle.lock() 直接把计数清掉——否则这里的 60 秒下限会在
+        // lockout-seconds 小于 60 时让计数永远停在阈值上，一输错就立刻再锁一轮。
         long retentionMillis = Math.max(lockoutSeconds, 60L) * 1000L;
 
         LoginThrottle.Failures failures = plugin.throttle().recordFailure(name, ip, now, retentionMillis);

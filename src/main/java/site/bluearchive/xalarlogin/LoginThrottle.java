@@ -15,8 +15,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * 阈值判定的话，NAT / CGNAT 后面共用一个出口 IP 的玩家会互相牵连：一个人输错三次密码，
  * 同一栋楼的所有人都进不来。IP 维度的阈值应当明显宽于玩家名维度。
  *
- * <p>状态变更都在主线程发生，但用 ConcurrentHashMap 以便将来放宽（进服前的拦截跑在
- * PlayerLoginEvent 上，仍是主线程，但读路径不依赖这一点）。
+ * <p><b>线程约定</b>：计数与锁定的写入只发生在主线程（{@code LoginCommand} 的回调、
+ * 管理命令的回调），但{@link #remainingLockSeconds}是从 {@code AsyncPlayerPreLoginEvent}
+ * 读的，跑在异步线程上。ConcurrentHashMap 只保证 map 结构本身的可见性，不保证之后对
+ * Counter 内部字段的普通写对其他线程可见，所以 {@code lockedUntil} 必须是 volatile ——
+ * 否则进服拦截可能读到过期的 0 而把已被锁定的来源放行。
  */
 public final class LoginThrottle {
 
@@ -25,8 +28,11 @@ public final class LoginThrottle {
     }
 
     private static final class Counter {
+        /** 只在主线程读写 */
         private int failures;
-        private long lockedUntil;
+        /** 主线程写、异步的进服拦截读，见类注释 */
+        private volatile long lockedUntil;
+        /** 只在主线程读写 */
         private long lastTouched;
     }
 
@@ -88,11 +94,20 @@ public final class LoginThrottle {
         lock(key("i:", ip), now, lockMillis);
     }
 
+    /**
+     * 锁定的同时把计数归零：一轮尝试到此结束，等锁到期就该重新给满额次数。
+     *
+     * <p>别把归零去掉改回「靠保留期自然过期」——那要求保留期严格短于锁定时长，而
+     * {@code LoginCommand} 给保留期设了 60 秒下限。{@code lockout-seconds} 填任何小于 60
+     * 的值时，锁定到期后第一次输错就会因为计数还停在阈值上而立刻再锁一轮，无限循环，
+     * 玩家实际上每个窗口只剩一次机会。
+     */
     private void lock(String key, long now, long lockMillis) {
         if (key == null) {
             return;
         }
         Counter counter = counters.computeIfAbsent(key, ignored -> new Counter());
+        counter.failures = 0;
         counter.lockedUntil = now + lockMillis;
         counter.lastTouched = now;
     }

@@ -17,11 +17,13 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.block.SignChangeEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerCommandSendEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
@@ -301,6 +303,25 @@ public final class RestrictionListener implements Listener {
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
     public void onEditBook(PlayerEditBookEvent event) {
         if (isRestricted(event.getPlayer())) {
+            event.setCancelled(true);
+        }
+    }
+
+    /** 告示牌的编辑界面也是客户端本地打开的，服务端只会收到这个事件。 */
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onSignChange(SignChangeEvent event) {
+        if (isRestricted(event.getPlayer())) {
+            event.setCancelled(true);
+        }
+    }
+
+    /**
+     * 兜底：容器界面正常要先 PlayerInteractEvent，那条路已经堵了，但第三方插件可以直接
+     * {@code openInventory()} 而不经过交互。挡在这里比逐个补 click/drag 更彻底。
+     */
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onInventoryOpen(InventoryOpenEvent event) {
+        if (event.getPlayer() instanceof Player player && isRestricted(player)) {
             event.setCancelled(true);
         }
     }

@@ -93,7 +93,14 @@ public final class XalarLoginPlugin extends JavaPlugin {
             return;
         }
         File spigotYml = new File(serverRoot, "spigot.yml");
-        if (!spigotYml.isFile() || !YamlConfiguration.loadConfiguration(spigotYml).getBoolean("commands.log", true)) {
+        if (!spigotYml.isFile()) {
+            // 用 --spigot-settings 换过路径时会走到这里。这条警告是「密码明文落盘」唯一的缓解
+            // 手段，静默跳过等于让管理员以为没问题，所以至少留个痕迹
+            getLogger().info("未找到 " + spigotYml.getPath()
+                    + "，跳过命令日志检查；请自行确认 spigot.yml 里 commands.log 为 false");
+            return;
+        }
+        if (!YamlConfiguration.loadConfiguration(spigotYml).getBoolean("commands.log", true)) {
             return;
         }
         getLogger().warning("=========================== 安全警告 ===========================");
@@ -108,6 +115,10 @@ public final class XalarLoginPlugin extends JavaPlugin {
     /**
      * 关服时 Bukkit 只取消尚未开始的任务，已经在跑的异步任务会继续执行。
      * 直接关连接会让正在进行的注册/改密静默失败，这里给它们一点收尾时间。
+     *
+     * <p>注意这个上限只约束轮询循环，不约束整个关服路径：超时后紧接着的
+     * {@code database.close()} 是 {@code synchronized} 的，会排在卡住的那个查询后面。
+     * 真正让它有界的是 {@code Database} 给 MySQL 补的 socketTimeout 默认值。
      */
     private void awaitPendingTasks() {
         long deadline = System.currentTimeMillis() + SHUTDOWN_DRAIN_MILLIS;

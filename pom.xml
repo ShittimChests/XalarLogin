@@ -30,6 +30,16 @@
       <version>[26.2.build,)</version>
       <scope>provided</scope>
     </dependency>
+    <!--
+      测试范围，不进 jar。只测不依赖 Bukkit 的纯逻辑（节流的时间窗口、密码哈希、
+      后端解析），这些恰好是手工连服最难覆盖、又最容易改错的部分。
+    -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.11.4</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -42,6 +52,11 @@
         <configuration>
           <release>25</release>
         </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
       </plugin>
     </plugins>
   </build>

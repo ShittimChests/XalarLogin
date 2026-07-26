@@ -31,6 +31,9 @@ storage:
     # 你的数据库密码。数据库和服务端不在同一台机器上时尤其危险。
     # autoDeserialize / allowLoadLocalInfile / allowUrlInLocalInfile /
     # allowMultiQueries / databaseTerm 会被插件直接拒绝，见启动日志。
+    # 没写 connectTimeout / socketTimeout 时插件会补上 5 秒 / 30 秒：Connector/J
+    # 默认读超时不限时，数据库变成网络黑洞时一次查询能挂到 TCP 自己放弃为止，
+    # 期间所有人的登录都卡住、关服也得排在它后面。要改就在这里显式写。
     properties: 'sslMode=PREFERRED&characterEncoding=utf8&serverTimezone=UTC'
 
 # ---------------- 认证行为 ----------------
@@ -43,6 +46,7 @@ max-login-attempts: 3
 
 # 被踢出后的锁定时长（秒）：这段时间内被锁定的玩家名 / IP 无法再进服尝试。
 # 失败次数按玩家名和来源 IP 分别累计，重连不会清零，用于挡住反复重连爆破。
+# 锁定到期后计数归零，重新给满 max-login-attempts 次机会。
 # 设为 0 表示不锁定（踢出后可立即重连再试，不推荐）
 lockout-seconds: 300
 
@@ -103,6 +107,7 @@ messages:
   admin-passwd-success: '&a已重设玩家 {player} 的密码（共 {count} 条记录），免密登录已作废'
   admin-passwd-notify: '&e管理员已重设你的密码，请使用新密码登录'
   admin-player-not-found: '&c未找到玩家 {player} 的账号记录'
+  admin-target-busy: '&c玩家 {player} 正在处理注册/登录/改密，请稍候重试'
   kick-too-many-attempts: '&c密码错误次数过多，请稍后再试'
   kick-locked-out: '&c密码错误次数过多，请在 {seconds} 秒后再试'
   kick-timeout: '&c登录超时，请重新进入服务器'

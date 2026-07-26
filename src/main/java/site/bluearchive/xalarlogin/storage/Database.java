@@ -8,6 +8,9 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
@@ -37,6 +40,11 @@ public final class Database implements AutoCloseable {
 
     /** 表名会直接拼进 SQL，只允许标识符字符 */
     private static final Pattern SAFE_TABLE = Pattern.compile("[A-Za-z0-9_]{1,64}");
+    /** 主机名 / IPv4，或方括号包起来的 IPv6 */
+    private static final Pattern SAFE_HOST =
+            Pattern.compile("[A-Za-z0-9._-]{1,255}|\\[[0-9A-Fa-f:.]{2,45}]");
+    /** 库名拼在 URL 的路径段上，允许 MySQL 标识符里实际会用到的字符 */
+    private static final Pattern SAFE_DATABASE = Pattern.compile("[A-Za-z0-9_$-]{1,64}");
     private static final String DEFAULT_TABLE = "accounts";
 
     /**
@@ -45,10 +53,25 @@ public final class Database implements AutoCloseable {
      * <p>前四个会把「连到恶意或被劫持的 MySQL」升级成服务端上的任意文件读取或反序列化执行，
      * 而这个插件一个都用不到。{@code databaseTerm} 则会让 {@code getCatalog()} 返回 null，
      * 使 {@link #migrateAddLastIp} 的列检测永远判为「缺列」，启动时 ALTER 撞重复列直接停用插件。
+     *
+     * <p>光过滤 properties 是不够的：{@code host} 与 {@code database} 也是原样拼进同一个 URL 的，
+     * 不校验的话 {@code database: 'xalarlogin?allowLoadLocalInfile=true'} 就能绕过这份名单。
+     * 所以三个字段都要卡，见 {@link #SAFE_HOST} 与 {@link #SAFE_DATABASE}。
      */
     private static final Set<String> BANNED_PROPERTIES = Set.of(
             "autodeserialize", "allowloadlocalinfile", "allowurlinlocalinfile",
             "allowmultiqueries", "databaseterm");
+
+    /**
+     * 没显式配置时补上的连接/读超时。
+     *
+     * <p>Connector/J 的 socketTimeout 默认不限时，网络黑洞时一次读能挂到 TCP 自己放弃为止。
+     * 而 {@link #execute} 是 {@code synchronized} 的，一个挂住的读会一直占着这把锁：登录全卡在
+     * LOADING，关服时 {@code close()} 也得排在它后面，{@code XalarLoginPlugin} 那 2 秒收尾上限
+     * 就形同虚设。补默认值而不是只写进 config.yml，是为了让升级上来的老配置也能受益。
+     */
+    private static final String DEFAULT_CONNECT_TIMEOUT = "connectTimeout=5000";
+    private static final String DEFAULT_SOCKET_TIMEOUT = "socketTimeout=30000";
 
     @FunctionalInterface
     private interface SqlAction<T> {
@@ -107,27 +130,66 @@ public final class Database implements AutoCloseable {
         if (database.isBlank()) {
             throw new SQLException("storage.mysql.database 不能为空");
         }
+        if (!SAFE_DATABASE.matcher(database).matches()) {
+            throw new SQLException("storage.mysql.database 只能包含字母、数字、下划线、$ 和减号，"
+                    + "当前配置为: " + database);
+        }
+        String host = mysql.getString("host", "localhost");
+        if (!SAFE_HOST.matcher(host).matches()) {
+            throw new SQLException("storage.mysql.host 不是合法的主机名或 IP（IPv6 请用方括号包起来），"
+                    + "当前配置为: " + host);
+        }
+        int port = mysql.getInt("port", 3306);
+        if (port < 1 || port > 65535) {
+            throw new SQLException("storage.mysql.port 必须在 1~65535 之间，当前配置为: " + port);
+        }
         String table = mysql.getString("table", DEFAULT_TABLE);
         if (!SAFE_TABLE.matcher(table).matches()) {
             throw new SQLException("storage.mysql.table 只能包含字母、数字和下划线，当前配置为: " + table);
         }
         String properties = mysql.getString("properties", "");
         checkProperties(properties);
-        String url = "jdbc:mysql://" + mysql.getString("host", "localhost")
-                + ":" + mysql.getInt("port", 3306) + "/" + database
-                + (properties.isBlank() ? "" : "?" + properties);
+        String url = "jdbc:mysql://" + host + ":" + port + "/" + database
+                + "?" + withTimeoutDefaults(properties);
         return new Database(backend, url, mysql.getString("user", ""), mysql.getString("password", ""), table);
     }
 
     /** properties 是原样拼进 JDBC URL 的，先把已知会造成危害的参数挡掉。 */
     private static void checkProperties(String properties) throws SQLException {
-        for (String pair : properties.split("&")) {
-            String key = pair.split("=", 2)[0].trim().toLowerCase(Locale.ROOT);
+        for (String key : propertyKeys(properties)) {
             if (BANNED_PROPERTIES.contains(key)) {
                 throw new SQLException("storage.mysql.properties 里不允许出现 " + key
                         + "，它会让插件在连到恶意数据库时受到攻击，或破坏建表迁移");
             }
         }
+    }
+
+    /** @return properties 里出现过的参数名，全部小写 */
+    private static Set<String> propertyKeys(String properties) {
+        Set<String> keys = new HashSet<>();
+        for (String pair : properties.split("&")) {
+            String key = pair.split("=", 2)[0].trim().toLowerCase(Locale.ROOT);
+            if (!key.isEmpty()) {
+                keys.add(key);
+            }
+        }
+        return keys;
+    }
+
+    /** 管理员没显式配超时时补上默认值，理由见 {@link #DEFAULT_SOCKET_TIMEOUT}。包级可见以便测试。 */
+    static String withTimeoutDefaults(String properties) {
+        Set<String> present = propertyKeys(properties);
+        List<String> parts = new ArrayList<>(3);
+        if (!present.contains("connecttimeout")) {
+            parts.add(DEFAULT_CONNECT_TIMEOUT);
+        }
+        if (!present.contains("sockettimeout")) {
+            parts.add(DEFAULT_SOCKET_TIMEOUT);
+        }
+        if (!properties.isBlank()) {
+            parts.add(properties);
+        }
+        return String.join("&", parts);
     }
 
     public Backend backend() {
@@ -158,6 +220,12 @@ public final class Database implements AutoCloseable {
      *
      * <p>不在正常路径上调 isValid()——那是一次额外往返。只有真的抛异常了才去验，
      * 这样空闲被掐断的连接能自愈，而正常查询不用付代价。
+     *
+     * <p><b>action 必须幂等</b>：重试跑的是整个 action，而语句有可能是「服务端已经执行成功、
+     * 只是返回途中连接断了」。现有调用都满足——SELECT 无副作用，INSERT IGNORE 与三条按主键
+     * 的 UPDATE 重跑一遍结果相同。两个已知的边角：{@link #deleteByName} 重跑会返回 0，管理员
+     * 会看到「未找到玩家」而记录其实已删；{@link #migrateAddLastIp} 的 ALTER 重跑会撞重复列。
+     * 两者都要求第一次已经到达服务端才会发生，新增非幂等语句前请先想清楚这一点。
      */
     private synchronized <T> T execute(SqlAction<T> action) throws SQLException {
         if (connection == null || connection.isClosed()) {

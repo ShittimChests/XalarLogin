@@ -131,6 +131,9 @@ storage:
 - **库要你自己先建好**，插件只自动建表不建库：
   `CREATE DATABASE xalarlogin DEFAULT CHARSET utf8mb4;`
 - `table` 只允许字母、数字、下划线。多个服务器想各用各的账号，改这个值区分即可
+- `host`、`database`、`port` 也会被校验（这三个和 `properties` 一样是拼进 JDBC URL 的，
+  不卡住的话 `database: 'xalarlogin?allowLoadLocalInfile=true'` 就能绕过下面那份参数黑名单）。
+  IPv6 地址请用方括号包起来，例：`host: '[2001:db8::1]'`
 - 改完 `storage` 段**必须重启服务器**，`/reload` 不会重连数据库
 - 配置写错（库名为空、后端名拼错、连不上）时插件会**直接停用并在控制台说明原因**，
   不会静默退回 SQLite —— 那样会让本该连 MySQL 的服务器悄悄建一个空库，
@@ -143,6 +146,9 @@ storage:
   数据库密码。数据库和服务端不在同一台机器上时尤其危险
 - 出于同样的理由，`autoDeserialize`、`allowLoadLocalInfile`、`allowUrlInLocalInfile`、
   `allowMultiQueries`、`databaseTerm` 这几个参数会被插件直接拒绝并在启动时报错
+- 没写 `connectTimeout` / `socketTimeout` 时插件会补上 **5 秒 / 30 秒**。Connector/J 的读超时
+  默认不限时，数据库变成网络黑洞（丢包而不是拒连）时一次查询能挂到 TCP 自己放弃为止，期间
+  所有人的登录都卡住、关服也得排在它后面。要用别的值就在 `properties` 里显式写
 
 ### 配置项（config.yml）
 
@@ -171,6 +177,9 @@ storage:
 
 - 玩家名：错 `max-login-attempts` 次（默认 3）即锁定该名字
 - IP：错 `max-login-attempts × ip-lockout-factor` 次（默认 15）才锁定该地址
+
+**锁定到期后计数归零**，玩家重新拿到完整的 `max-login-attempts` 次机会，不会「一进来输错一次就
+又被锁五分钟」。只有越线的那个维度会被锁：被 IP 阈值兜住时不会连带把玩家名也锁上，反之亦然。
 
 IP 阈值之所以宽这么多，是因为宿舍、家庭 NAT、运营商 CGNAT 后面往往几十个玩家共用一个出口 IP。
 两个维度共用阈值的话，一个人手滑输错三次就会把同网络的所有人一起锁在门外五分钟。
