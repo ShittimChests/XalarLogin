@@ -33,12 +33,16 @@ public final class XalarLoginPlugin extends JavaPlugin {
         warnIfCommandLoggingEnabled();
 
         try {
-            database = new Database(getDataFolder());
+            database = Database.create(getConfig().getConfigurationSection("storage"), getDataFolder());
         } catch (SQLException e) {
-            getLogger().severe("无法初始化 SQLite 数据库: " + e.getMessage());
+            // 配置写错时宁可停在这里也不要静默退回 SQLite——那会让本该连 MySQL 的服务器
+            // 悄悄建一个本地空库，看起来「所有人都没注册过」
+            getLogger().severe("无法初始化数据库: " + e.getMessage());
+            getLogger().severe("请检查 config.yml 的 storage 段；插件已停用。");
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
+        getLogger().info("存储后端: " + database.backend());
 
         sessions = new SessionManager();
         throttle = new LoginThrottle();

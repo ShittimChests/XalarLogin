@@ -4,6 +4,31 @@
 # 也就是说 /reg 和 /a 的密码会明文落盘。该日志早于插件事件触发，
 # 插件无法拦截 —— 请把服务器根目录 spigot.yml 里的 commands.log 改为 false。
 
+# ---------------- 存储后端 ----------------
+# 两种后端的 JDBC 驱动都由 Paper 服务端自带，切换不需要装任何东西。
+# 改动 storage 段后必须重启服务器。
+storage:
+  # sqlite：单文件，零配置，数据在 plugins/XalarLogin/data.db，适合单服
+  # mysql ：外部数据库，适合多个服务器共享同一份账号
+  type: sqlite
+
+  # 仅当 type 为 mysql 时使用。数据库需要你自己预先创建好
+  # （例：CREATE DATABASE xalarlogin DEFAULT CHARSET utf8mb4;），
+  # 插件只会自动建表，不会自动建库
+  mysql:
+    host: localhost
+    port: 3306
+    # 数据库名，必须已存在
+    database: xalarlogin
+    user: xalarlogin
+    password: ''
+    # 表名，插件会自动创建。多个服务器想各用各的账号时改这里区分
+    table: accounts
+    # 追加到 JDBC URL 的参数，一般不用动
+    properties: 'useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=utf8&serverTimezone=UTC'
+
+# ---------------- 认证行为 ----------------
+
 # 登录超时（秒）：加入服务器后超过此时间未注册/登录将被踢出
 login-timeout-seconds: 60
 
@@ -56,8 +81,10 @@ messages:
   changepw-wrong-old: '&c旧密码错误'
   db-error: '&c数据出错，请稍后重试或联系管理员'
   player-only: '&c该命令只能由玩家执行'
-  admin-usage: '&c用法：/xalar unregister <玩家>'
+  admin-usage: '&c用法：&6/xalar unregister <玩家> &c或 &6/xalar passwd <玩家> <新密码>'
   admin-unregister-success: '&a已删除玩家 {player} 的账号记录（共 {count} 条）'
+  admin-passwd-success: '&a已重设玩家 {player} 的密码（共 {count} 条记录），免密登录已作废'
+  admin-passwd-notify: '&e管理员已重设你的密码，请使用新密码登录'
   admin-player-not-found: '&c未找到玩家 {player} 的账号记录'
   kick-too-many-attempts: '&c密码错误次数过多，请稍后再试'
   kick-locked-out: '&c密码错误次数过多，请在 {seconds} 秒后再试'

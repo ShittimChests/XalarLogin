@@ -3,8 +3,8 @@
 离线模式（offline-mode）Paper 服务器的注册/登录认证插件。玩家进服后先注册或登录，否则完全无法行动，防止账号被冒名顶替。
 
 - 适用服务端：**Paper 26.2**（需 Java 25 运行环境）
-- 数据存储：SQLite（`plugins/XalarLogin/data.db`），零外部依赖
-- 密码安全：PBKDF2-SHA256 加盐哈希（21 万次迭代），不存明文
+- 数据存储：**SQLite 或 MySQL 任选**，两种驱动都由 Paper 自带，零外部依赖
+- 密码安全：PBKDF2-SHA256 加盐哈希（默认 60 万次迭代），不存明文
 
 ---
 
@@ -86,18 +86,62 @@ commands:
 
 | 命令 | 说明 |
 |---|---|
-| `/xalar unregister <玩家名>` | 删除该玩家的账号记录（玩家名不区分大小写）。玩家若在线会被踢出，重新进服后需重新注册。用于处理忘记密码 |
+| `/xalar unregister <玩家名>` | 删除该玩家的账号记录。玩家若在线会被踢出，重新进服后需重新注册 |
+| `/xalar passwd <玩家名> <新密码>` | 直接把该玩家的密码改成新密码。玩家**不需要在线**，也不需要知道旧密码 |
 
-`unregister` 的回显会带上实际删除的条数。离线模式下 `Steve` 和 `steve` 是两个不同 UUID、
-两个独立账号，而删除按名字忽略大小写，所以看到「共 2 条」说明服务器上存在大小写不同的同名账号，
-两个都被删了 —— 留意是不是误删。
+两条命令的玩家名都不区分大小写，都会解除该玩家的登录失败锁定。
+
+**`passwd`** 用于玩家忘记密码——比 `unregister` 更省事，玩家不用重新注册，
+背包、权限之类挂在 UUID 上的东西也不受影响。执行后：
+
+- 该玩家的免密登录立即作废，下次进服必须输新密码
+- 如果玩家正在线上，会收到「管理员已重设你的密码」的提示，且会话内立刻改用新密码
+
+> ⚠️ 新密码会出现在你的命令里，也就会进控制台和日志（同上面「关闭命令日志」一节）。
+> 建议改完后让玩家自己用 `/changepw` 再改一次。
+
+`unregister` 与 `passwd` 的回显都会带上实际影响的条数。离线模式下 `Steve` 和 `steve` 是两个
+不同 UUID、两个独立账号，而这两条命令按名字忽略大小写，所以看到「共 2 条」说明服务器上存在
+大小写不同的同名账号，两个都被改/删了 —— 留意是不是误操作。
 
 权限：`xalarlogin.admin`（默认仅 OP），控制台也可执行。
+
+### 存储后端：SQLite 或 MySQL
+
+默认用 SQLite，单文件零配置，绝大多数单服直接用就行。**多个服务器要共享同一份账号**时改用 MySQL。
+两种驱动 Paper 都自带（`libraries/` 下的 sqlite-jdbc 与 mysql-connector-j），切换不用装任何东西。
+
+```yaml
+storage:
+  type: mysql          # sqlite 或 mysql
+  mysql:
+    host: localhost
+    port: 3306
+    database: xalarlogin      # 必须是已经存在的库
+    user: xalarlogin
+    password: '你的密码'
+    table: accounts           # 表名，插件会自动创建
+    properties: 'useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=utf8&serverTimezone=UTC'
+```
+
+要点：
+
+- **库要你自己先建好**，插件只自动建表不建库：
+  `CREATE DATABASE xalarlogin DEFAULT CHARSET utf8mb4;`
+- `table` 只允许字母、数字、下划线。多个服务器想各用各的账号，改这个值区分即可
+- 改完 `storage` 段**必须重启服务器**，`/reload` 不会重连数据库
+- 配置写错（库名为空、后端名拼错、连不上）时插件会**直接停用并在控制台说明原因**，
+  不会静默退回 SQLite —— 那样会让本该连 MySQL 的服务器悄悄建一个空库，
+  表现成「所有人都没注册过」，比直接报错危险得多
+- 切换后端**不会自动迁移已有数据**。SQLite 的数据在 `plugins/XalarLogin/data.db`，
+  需要迁移的话得自己把 `accounts` 表导过去
 
 ### 配置项（config.yml）
 
 | 配置 | 默认值 | 说明 |
 |---|---|---|
+| `storage.type` | sqlite | 存储后端，`sqlite` 或 `mysql` |
+| `storage.mysql.*` | — | MySQL 连接信息，见上一节 |
 | `login-timeout-seconds` | 60 | 进服后多少秒未认证被踢出 |
 | `max-login-attempts` | 3 | 密码错误多少次被踢出并锁定 |
 | `lockout-seconds` | 300 | 被踢出后锁定多久，期间该玩家名与 IP 无法进服。设为 0 关闭锁定 |
@@ -126,9 +170,12 @@ commands:
 
 ### 数据说明
 
-- 账号数据在 `plugins/XalarLogin/data.db`（SQLite 单文件），备份服务器时一并备份即可
-- 密码以 PBKDF2-SHA256 加盐哈希存储，无法从数据库反查明文；玩家忘记密码只能 `unregister` 重置
+- SQLite 后端的账号数据在 `plugins/XalarLogin/data.db`（单文件），备份服务器时一并备份即可；
+  MySQL 后端的数据在你自己的库里，按你的数据库备份策略走
+- 密码以 PBKDF2-SHA256 加盐哈希存储，无法从数据库反查明文；玩家忘记密码用
+  `/xalar passwd` 直接改一个新的，或用 `/xalar unregister` 让他重新注册
 - 账号按玩家 UUID 记录（离线模式下由玩家名派生），改名等同于新账号
+- 两种后端的表结构一致：`accounts(uuid, name, password_hash, registered_at, last_login, last_ip)`
 
 ---
 
