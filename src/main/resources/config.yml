@@ -1,0 +1,49 @@
+# ============ XalarLogin 配置 ============
+
+# 登录超时（秒）：加入服务器后超过此时间未注册/登录将被踢出
+login-timeout-seconds: 60
+
+# 密码连续错误达到此次数将被踢出服务器
+max-login-attempts: 3
+
+# 密码最小长度
+min-password-length: 6
+
+# 未登录时的提示间隔（秒）
+remind-interval-seconds: 5
+
+# 同 IP 免密登录：用密码成功登录一次后，下次从相同 IP 进服自动登录；
+# IP 变化或修改过密码则需重新输入密码。设为 false 关闭此功能
+ip-session-enabled: true
+
+# 所有消息文案，支持 & 颜色代码
+# 可用占位符：{min} 最小密码长度、{remaining} 剩余尝试次数、{player} 玩家名
+messages:
+  prefix: '&7[&6XalarLogin&7] &r'
+  remind-register: '&e请输入 &6/reg <密码> <重复密码> &e来注册账号，例：&6/reg 123456 123456'
+  remind-login: '&e请输入 &6/a <密码> &e登录账号'
+  register-usage: '&c用法：/reg <密码> <重复密码>'
+  login-usage: '&c用法：/a <密码>'
+  changepw-usage: '&c用法：/changepw <旧密码> <新密码>'
+  already-registered: '&c你已注册过账号，请使用 &6/a <密码> &c登录'
+  not-registered: '&c你还未注册，请先使用 &6/reg <密码> <重复密码> &c注册'
+  already-logged-in: '&a你已经登录了'
+  loading: '&e正在加载你的数据，请稍候再试'
+  password-mismatch: '&c两次输入的密码不一致，请重新输入'
+  password-too-short: '&c密码太短，至少需要 {min} 位'
+  register-success: '&a注册成功，已自动登录，祝你游戏愉快！'
+  login-success: '&a登录成功，欢迎回来！'
+  auto-login: '&a检测到你上次登录的 IP，已自动登录，欢迎回来！'
+  wrong-password: '&c密码错误！还剩 {remaining} 次机会'
+  must-login-first: '&c请先登录后再进行操作'
+  changepw-success: '&a密码修改成功'
+  changepw-wrong-old: '&c旧密码错误'
+  db-error: '&c数据出错，请稍后重试或联系管理员'
+  player-only: '&c该命令只能由玩家执行'
+  admin-usage: '&c用法：/xalar unregister <玩家>'
+  admin-unregister-success: '&a已删除玩家 {player} 的账号'
+  admin-player-not-found: '&c未找到玩家 {player} 的账号记录'
+  kick-too-many-attempts: '&c密码错误次数过多，请稍后再试'
+  kick-timeout: '&c登录超时，请重新进入服务器'
+  kick-db-error: '&c数据加载失败，请重新进入服务器'
+  kick-unregistered: '&c你的账号已被管理员重置，请重新进服注册'

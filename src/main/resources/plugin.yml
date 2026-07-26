@@ -1,0 +1,28 @@
+name: XalarLogin
+version: '1.0.0'
+main: site.bluearchive.xalarlogin.XalarLoginPlugin
+api-version: '26.2'
+description: 简单的注册/登录认证插件
+authors: [cyterx]
+
+commands:
+  reg:
+    description: 注册账号
+    usage: /reg <密码> <重复密码>
+    aliases: [register]
+  a:
+    description: 登录账号
+    usage: /a <密码>
+    aliases: [l, login]
+  changepw:
+    description: 修改密码
+    usage: /changepw <旧密码> <新密码>
+  xalar:
+    description: XalarLogin 管理命令
+    usage: /xalar unregister <玩家>
+    permission: xalarlogin.admin
+
+permissions:
+  xalarlogin.admin:
+    description: XalarLogin 管理权限（重置玩家账号等）
+    default: op

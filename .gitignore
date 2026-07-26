@@ -1,0 +1,16 @@
+# Maven
+target/
+
+# Claude Code 本地设置（含个人权限白名单，不入库）
+.claude/settings.local.json
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
