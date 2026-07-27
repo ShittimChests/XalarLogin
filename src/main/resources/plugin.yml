@@ -19,7 +19,7 @@ commands:
     usage: /changepw <旧密码> <新密码>
   xalar:
     description: XalarLogin 管理命令
-    usage: /xalar unregister <玩家>
+    usage: /xalar unregister <玩家> | /xalar passwd <玩家> <新密码> | /xalar unlock <玩家名|IP>
     permission: xalarlogin.admin
 
 permissions:

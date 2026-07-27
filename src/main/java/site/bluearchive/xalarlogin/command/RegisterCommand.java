@@ -14,8 +14,9 @@ import site.bluearchive.xalarlogin.SessionManager.Phase;
 import site.bluearchive.xalarlogin.SessionManager.Session;
 import site.bluearchive.xalarlogin.XalarLoginPlugin;
 import site.bluearchive.xalarlogin.listener.RestrictionListener;
+import site.bluearchive.xalarlogin.storage.Database;
 
-/** /reg <密码> <重复密码> */
+/** /reg &lt;密码&gt; &lt;重复密码&gt; */
 public final class RegisterCommand implements CommandExecutor {
 
     private final XalarLoginPlugin plugin;
@@ -64,37 +65,65 @@ public final class RegisterCommand implements CommandExecutor {
             player.sendMessage(plugin.message("password-too-short", "{min}", String.valueOf(minLength)));
             return true;
         }
+        if (!session.busy.compareAndSet(false, true)) {
+            player.sendMessage(plugin.message("processing"));
+            return true;
+        }
 
-        // 防止重复提交：处理期间置回 LOADING
-        session.phase = Phase.LOADING;
         UUID uuid = player.getUniqueId();
         String password = args[0];
         String name = player.getName();
         String ip = RestrictionListener.playerIp(player);
+        int iterations = plugin.hashIterations();
 
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
-            String hash = PasswordHasher.hash(password);
+            String hash = PasswordHasher.hash(password, iterations);
+            boolean inserted = false;
+            Database.Account existing = null;
             SQLException failure = null;
             try {
-                plugin.database().register(uuid, name, hash, ip);
+                inserted = plugin.database().register(uuid, name, hash, ip);
+                if (!inserted) {
+                    // 这次注册的异步处理途中玩家退服重连过，账号其实已经落库了。
+                    // 把真实哈希读回来，让玩家直接去 /a，而不是卡在「注册失败」里出不来。
+                    existing = plugin.database().findAccount(uuid);
+                }
             } catch (SQLException e) {
                 failure = e;
                 plugin.getLogger().severe("注册玩家 " + name + " 失败: " + e.getMessage());
             }
+            final boolean created = inserted;
+            final Database.Account account = existing;
             final SQLException error = failure;
 
-            plugin.getServer().getScheduler().runTask(plugin, () -> {
-                Session current = plugin.sessions().get(uuid);
-                if (current == null || !player.isOnline()) {
+            plugin.runOnMain(() -> {
+                session.busy.set(false);
+                if (plugin.sessions().get(uuid) != session || !player.isOnline()
+                        || session.phase != Phase.NEED_REGISTER) {
                     return;
                 }
                 if (error != null) {
-                    current.phase = Phase.NEED_REGISTER;
                     player.sendMessage(plugin.message("db-error"));
                     return;
                 }
-                current.passwordHash = hash;
-                plugin.sessions().markLoggedIn(uuid);
+                if (!created) {
+                    if (account == null) {
+                        // 插入被忽略却又查不到记录，说明这中间账号被删了；留在 NEED_REGISTER 让玩家重试
+                        player.sendMessage(plugin.message("db-error"));
+                        return;
+                    }
+                    session.setPasswordHash(account.passwordHash());
+                    session.phase = Phase.NEED_LOGIN;
+                    player.sendMessage(plugin.message("already-registered"));
+                    return;
+                }
+                session.setPasswordHash(hash);
+                plugin.sessions().markLoggedIn(player);
+                // 只清玩家名维度，不要传 ip：离线模式下注册一个新名字是零成本的，
+                // 顺手清掉 IP 计数等于让攻击者随时免费重置 ip-lockout-factor 那道防线
+                // （喷到阈值前一次就注册个一次性账号归零，IP 维度永远不会触发）。
+                // 刚注册的名字本来就没有失败记录，这里清 IP 也没有任何正当理由
+                plugin.throttle().clearName(name);
                 player.sendMessage(plugin.message("register-success"));
             });
         });

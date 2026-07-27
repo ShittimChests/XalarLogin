@@ -1,10 +1,70 @@
 # ============ XalarLogin 配置 ============
+#
+# 安全提示：Paper 默认会把玩家执行的命令原文写进 logs/latest.log，也就是说
+# /reg、/a、/changepw、/xalar passwd 的密码都会明文落盘。该日志早于插件事件
+# 触发，插件无法拦截 —— 请把服务器根目录 spigot.yml 里的 commands.log 改为 false。
+
+# ---------------- 存储后端 ----------------
+# 两种后端的 JDBC 驱动都由 Paper 服务端自带，切换不需要装任何东西。
+# 改动 storage 段后必须重启服务器。
+storage:
+  # sqlite：单文件，零配置，数据在 plugins/XalarLogin/data.db，适合单服
+  # mysql ：外部数据库，适合多个服务器共享同一份账号
+  type: sqlite
+
+  # 仅当 type 为 mysql 时使用。数据库需要你自己预先创建好
+  # （例：CREATE DATABASE xalarlogin DEFAULT CHARSET utf8mb4;），
+  # 插件只会自动建表，不会自动建库
+  mysql:
+    host: localhost
+    port: 3306
+    # 数据库名，必须已存在
+    database: xalarlogin
+    user: xalarlogin
+    password: ''
+    # 表名，插件会自动创建。多个服务器想各用各的账号时改这里区分
+    table: accounts
+    # 追加到 JDBC URL 的参数，一般不用动。
+    # 默认 sslMode=PREFERRED：数据库支持 TLS 就加密，不支持则回退明文。
+    # 不要改成 useSSL=false + allowPublicKeyRetrieval=true —— MySQL 8 默认的
+    # caching_sha2_password 下，这个组合允许中间人塞入自己的 RSA 公钥并还原出
+    # 你的数据库密码。数据库和服务端不在同一台机器上时尤其危险。
+    # autoDeserialize / allowLoadLocalInfile / allowLoadLocalInfileInPath /
+    # allowUrlInLocalInfile / allowMultiQueries / databaseTerm / propertiesTransform /
+    # socketFactory / queryInterceptors 会被插件直接拒绝，见启动日志。
+    # 百分号编码（如 %61llow...）也会被拒绝，否则可以绕过上面这份名单。
+    # 没写 connectTimeout / socketTimeout 时插件会补上 5 秒 / 30 秒：Connector/J
+    # 默认读超时不限时，数据库变成网络黑洞时一次查询能挂到 TCP 自己放弃为止，
+    # 期间所有人的登录都卡住、关服也得排在它后面。要改就在这里显式写。
+    properties: 'sslMode=PREFERRED&characterEncoding=utf8&serverTimezone=UTC'
+
+# ---------------- 认证行为 ----------------
 
 # 登录超时（秒）：加入服务器后超过此时间未注册/登录将被踢出
 login-timeout-seconds: 60
 
-# 密码连续错误达到此次数将被踢出服务器
+# 密码连续错误达到此次数将被踢出服务器，并锁定该玩家名
 max-login-attempts: 3
+
+# 被踢出后的锁定时长（秒）：这段时间内被锁定的玩家名 / IP 无法再进服尝试。
+# 失败次数按玩家名和来源 IP 分别累计，重连不会清零，用于挡住反复重连爆破。
+# 锁定到期后计数归零，重新给满 max-login-attempts 次机会。
+# 设为 0 表示只踢出、不锁定（可以立即重连），此时计数同样会归零，
+# 重连后仍然有完整的 max-login-attempts 次机会
+lockout-seconds: 300
+
+# IP 维度的锁定阈值 = max-login-attempts × 这个倍数（默认 3 × 5 = 15 次）。
+# 之所以比玩家名宽这么多：宿舍、家庭 NAT、运营商 CGNAT 后面几十个玩家共用一个
+# 出口 IP，两个维度用同一个阈值的话，一个人输错三次就会把所有人一起锁在门外。
+#
+# 注意：成功登录只会清除该玩家名的失败记录，不会清除 IP 的。离线模式下注册账号是
+# 零成本的，如果成功登录能清 IP 计数，攻击者随时可以注册一个自己的账号登录一次把它
+# 归零，这道防线就没用了。IP 计数靠「保留期内没有新失败」和「锁定到期」自行回收，
+# 代价是共用出口 IP 的失败会在一段时间内累积——这正是它的阈值要宽得多的原因。
+# 被误锁时管理员可以用 /xalar unlock <玩家名|IP> 立即解除；触发锁定时控制台会记一条
+# 带具体玩家名 / IP 的日志，照着它传参即可。
+# 设为 0 表示只按玩家名锁定，完全不按 IP 锁定
+ip-lockout-factor: 5
 
 # 密码最小长度
 min-password-length: 6
@@ -13,11 +73,25 @@ min-password-length: 6
 remind-interval-seconds: 5
 
 # 同 IP 免密登录：用密码成功登录一次后，下次从相同 IP 进服自动登录；
-# IP 变化或修改过密码则需重新输入密码。设为 false 关闭此功能
-ip-session-enabled: true
+# IP 变化或修改过密码则需重新输入密码。
+#
+# ⚠️ 默认关闭，开启前务必想清楚：离线模式下任何人都能用别人的名字进服，
+# 而这个功能只比对出口 IP。宿舍、家庭 NAT、运营商 CGNAT、同一个 VPN 出口
+# 后面的人因此可以互相顶号，完全不需要密码，也完全绕过失败锁定。
+# 只有在你确信每个玩家都有独立公网 IP 时才建议开启。
+#
+# 从旧版本升级的服务器请注意：这一项以前的默认值是 true，而升级只会覆盖 jar、
+# 不会改你已有的 config.yml。仍然开着的话插件启动时会打一条安全警告
+ip-session-enabled: false
+
+# 密码哈希 PBKDF2 迭代次数，越高越难爆破但登录越慢（60 万约需 0.2 秒）。
+# 有效范围 10 万 ~ 1000 万，超出会被自动钳到边界。调整后老账号仍按注册时的
+# 迭代次数校验，只有新注册和改密码才会用上新值，不会导致任何人登录不了
+password-hash-iterations: 600000
 
 # 所有消息文案，支持 & 颜色代码
-# 可用占位符：{min} 最小密码长度、{remaining} 剩余尝试次数、{player} 玩家名
+# 可用占位符：{min} 最小密码长度、{remaining} 剩余尝试次数、{player} 玩家名、
+#             {seconds} 锁定剩余秒数、{count} 删除的记录数、{target} 解锁目标
 messages:
   prefix: '&7[&6XalarLogin&7] &r'
   remind-register: '&e请输入 &6/reg <密码> <重复密码> &e来注册账号，例：&6/reg 123456 123456'
@@ -29,6 +103,7 @@ messages:
   not-registered: '&c你还未注册，请先使用 &6/reg <密码> <重复密码> &c注册'
   already-logged-in: '&a你已经登录了'
   loading: '&e正在加载你的数据，请稍候再试'
+  processing: '&e正在处理你的上一条指令，请稍候'
   password-mismatch: '&c两次输入的密码不一致，请重新输入'
   password-too-short: '&c密码太短，至少需要 {min} 位'
   register-success: '&a注册成功，已自动登录，祝你游戏愉快！'
@@ -40,10 +115,17 @@ messages:
   changepw-wrong-old: '&c旧密码错误'
   db-error: '&c数据出错，请稍后重试或联系管理员'
   player-only: '&c该命令只能由玩家执行'
-  admin-usage: '&c用法：/xalar unregister <玩家>'
-  admin-unregister-success: '&a已删除玩家 {player} 的账号'
+  admin-usage: '&c用法：&6/xalar unregister <玩家> &c| &6/xalar passwd <玩家> <新密码> &c| &6/xalar unlock <玩家名|IP>'
+  admin-unregister-success: '&a已删除玩家 {player} 的账号记录（共 {count} 条）'
+  admin-passwd-success: '&a已重设玩家 {player} 的密码（共 {count} 条记录），免密登录已作废'
+  admin-passwd-notify: '&e管理员已重设你的密码，请使用新密码登录'
   admin-player-not-found: '&c未找到玩家 {player} 的账号记录'
+  admin-target-busy: '&c玩家 {player} 正在处理注册/登录/改密，请稍候重试'
+  admin-unlock-success: '&a已解除 {target} 的登录失败锁定'
+  admin-unlock-nothing: '&e{target} 当前没有失败记录或锁定，无需解除（被锁的 IP 见控制台日志）'
   kick-too-many-attempts: '&c密码错误次数过多，请稍后再试'
+  kick-locked-out: '&c密码错误次数过多，请在 {seconds} 秒后再试'
   kick-timeout: '&c登录超时，请重新进入服务器'
   kick-db-error: '&c数据加载失败，请重新进入服务器'
   kick-unregistered: '&c你的账号已被管理员重置，请重新进服注册'
+  kick-plugin-disabled: '&c认证插件已停用，请稍后再进入服务器'
