@@ -152,6 +152,34 @@ class DatabaseConfigTest {
     }
 
     @Test
+    @DisplayName("百分号编码会被拒绝——否则可以绕过整份黑名单")
+    void percentEncodingIsRejected(@TempDir File dataFolder) {
+        // Connector/J 解析 URL 时会做百分号解码，%61llowLoadLocalInfile 在校验侧看起来
+        // 不命中黑名单，到了驱动那里却会还原成 allowLoadLocalInfile
+        ConfigurationSection storage = mysqlConfig();
+        storage.getConfigurationSection("mysql")
+                .set("properties", "sslMode=PREFERRED&%61llowLoadLocalInfile=true");
+        // 断言必须用校验专属的文案：驱动缺失的异常消息里现在带着完整 URL，
+        // 而 URL 本身就含那个 %，拿 contains("%") 判的话删掉整个防护它照样绿
+        assertTrue(messageOf(storage, dataFolder).contains("不允许出现 %"), "应指出问题出在百分号上");
+    }
+
+    @Test
+    @DisplayName("会加载任意类的参数与 LOCAL INFILE 路径参数都在黑名单里")
+    void classLoadingPropertiesAreRejected(@TempDir File dataFolder) {
+        for (String pair : new String[]{
+                "allowLoadLocalInfileInPath=/",
+                "propertiesTransform=evil.Transform",
+                "socketFactory=evil.Factory",
+                "queryInterceptors=evil.Interceptor"}) {
+            ConfigurationSection storage = mysqlConfig();
+            storage.getConfigurationSection("mysql").set("properties", pair);
+            String key = pair.split("=")[0].toLowerCase(java.util.Locale.ROOT);
+            assertTrue(messageOf(storage, dataFolder).contains(key), pair + " 应被拒绝");
+        }
+    }
+
+    @Test
     @DisplayName("黑名单不区分大小写与空白")
     void bannedPropertiesIgnoreCaseAndSpaces() {
         MemoryConfiguration root = new MemoryConfiguration();
@@ -180,6 +208,58 @@ class DatabaseConfigTest {
     @DisplayName("properties 为空时也不会拼出空查询串")
     void timeoutDefaultsWithBlankProperties() {
         assertEquals("connectTimeout=5000&socketTimeout=30000", Database.withTimeoutDefaults(""));
+    }
+
+    @Test
+    @DisplayName("拼出来的 JDBC URL 形状正确，且超时默认值真的注入了")
+    void mysqlUrlIsAssembledCorrectly() {
+        assertEquals(
+                "jdbc:mysql://db.example.com:3306/xalarlogin"
+                        + "?connectTimeout=5000&socketTimeout=30000&sslMode=PREFERRED",
+                Database.buildMysqlUrl("db.example.com", 3306, "xalarlogin", "sslMode=PREFERRED"));
+    }
+
+    @Test
+    @DisplayName("create() 真的用上了拼装函数——超时默认值必须出现在生产路径拼出的 URL 里")
+    void createActuallyUsesAssembledUrl(@TempDir File dataFolder) {
+        // 上面那条只断言了 buildMysqlUrl 本身。光有它挡不住「重构时把 create() 里那次调用删掉、
+        // 改回裸 properties」——那样两个孤立的单测照样全绿，而线上表现是数据库变成网络黑洞时
+        // 一次读挂住 execute() 的锁、全服卡在 LOADING、连关服都关不掉。这条测的是 create()
+        // 自己拼出来的串（驱动不在测试 classpath 上，异常消息里带着它）。
+        String message = messageOf(mysqlConfig(), dataFolder);
+        assertTrue(message.contains("jdbc:mysql://db.example.com:3306/xalarlogin"), message);
+        assertTrue(message.contains("connectTimeout=5000"), "create() 必须补上连接超时默认值: " + message);
+        assertTrue(message.contains("socketTimeout=30000"), "create() 必须补上读超时默认值: " + message);
+    }
+
+    @Test
+    @DisplayName("IPv6 主机与自定义端口拼进 URL 的形状")
+    void mysqlUrlWithIpv6AndBlankProperties() {
+        assertEquals(
+                "jdbc:mysql://[2001:db8::1]:13306/mc_auth?connectTimeout=5000&socketTimeout=30000",
+                Database.buildMysqlUrl("[2001:db8::1]", 13306, "mc_auth", ""));
+    }
+
+    @Test
+    @DisplayName("URL 进日志前会把凭据类参数抹掉")
+    void secretsAreRedactedBeforeLogging() {
+        // create() 失败时会把 URL 打进控制台，而管理员贴启动日志求助是常态
+        String redacted = Database.redactSecrets(
+                "jdbc:mysql://h:3306/db?sslMode=REQUIRED&trustCertificateKeyStorePassword=hunter2&x=1");
+        assertTrue(redacted.contains("trustCertificateKeyStorePassword=***"), redacted);
+        assertTrue(redacted.contains("sslMode=REQUIRED"), "无关参数不该被抹: " + redacted);
+        assertTrue(redacted.contains("x=1"), redacted);
+    }
+
+    @Test
+    @DisplayName("关掉数据库加密的几种写法都会被识别出来（警告而非拒绝）")
+    void insecureTlsIsDetected() {
+        assertEquals("allowPublicKeyRetrieval=true",
+                Database.insecureTlsWarning("sslMode=DISABLED_TYPO&allowPublicKeyRetrieval=true"));
+        assertEquals("useSSL=false", Database.insecureTlsWarning("useSSL=false"));
+        assertEquals("sslMode=DISABLED", Database.insecureTlsWarning("sslMode=DISABLED"));
+        assertEquals(null, Database.insecureTlsWarning("sslMode=PREFERRED&characterEncoding=utf8"));
+        assertEquals(null, Database.insecureTlsWarning("allowPublicKeyRetrieval=false"));
     }
 
     @Test

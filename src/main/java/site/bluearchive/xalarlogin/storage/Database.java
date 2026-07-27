@@ -26,11 +26,13 @@ import org.bukkit.configuration.ConfigurationSection;
  * 串行化不构成瓶颈，省掉连接池依赖。MySQL 的连接会被服务端 {@code wait_timeout}
  * 掐断，所以每个操作都包在 {@link #execute} 里，失败时验一次连接并重连重试。
  *
- * <p><b>上层依赖这里的串行化，换连接池之前必须先补会话级校验。</b>
- * 例：玩家进服时的 {@code findAccount} 与管理员 {@code /xalar passwd} 的
- * {@code updatePasswordByName} 之间存在读改覆盖的窗口——进服回调会把查库那一刻的旧哈希、
- * 旧 last_ip 无条件写回会话。现在这个窗口跑不出来，因为单连接保证了 UPDATE 必然排在
- * SELECT 之后返回、对应的主线程回调也必然落在更后面的 tick。一旦并发化，这个不变式就没了。
+ * <p><b>这里的串行化只保证 SQL 的先后，保证不了主线程回调的先后。</b>
+ * 单连接 + {@code synchronized} 能让 {@code /xalar passwd} 的 UPDATE 必然排在进服的 SELECT
+ * 之后执行，但两个异步 worker 从各自的 SQL 返回、到调用 {@code runTask} 之间没有任何同步，
+ * 调度器按 {@code runTask} 的调用顺序排队。所以「进服回调把查库那一刻的旧哈希写回会话，
+ * 覆盖掉管理员刚写进去的新哈希」这个窗口是真实存在的，靠串行化关不掉——真正关掉它的是
+ * {@code Session.passwordGeneration}：进服回调发现代号变了就放弃写回。新增「先读后写会话」
+ * 的路径时请沿用这个代号，别再假设回调顺序。
  */
 public final class Database implements AutoCloseable {
 
@@ -59,8 +61,46 @@ public final class Database implements AutoCloseable {
      * 所以三个字段都要卡，见 {@link #SAFE_HOST} 与 {@link #SAFE_DATABASE}。
      */
     private static final Set<String> BANNED_PROPERTIES = Set.of(
-            "autodeserialize", "allowloadlocalinfile", "allowurlinlocalinfile",
-            "allowmultiqueries", "databaseterm");
+            // LOCAL INFILE 与反序列化：连到恶意/被劫持的 MySQL 时能读服务端本地文件或执行代码。
+            // autoDeserialize 在 Connector/J 9.x 已被移除，留着是为了兼容更老的驱动
+            "autodeserialize", "allowloadlocalinfile", "allowloadlocalinfileinpath",
+            "allowurlinlocalinfile", "allowmultiqueries",
+            // 会让 getCatalog() 返回 null，从而搞坏 migrateAddLastIp 的列检测
+            "databaseterm",
+            // 下面这些都会让 Connector/J 按名字去加载并实例化任意类。名字逐个对照过
+            // Connector/J 9.2.0 的 PropertyKey 枚举——写错名字比漏写更糟，那会让本来合法的
+            // 配置在升级后直接把插件停掉。ha.loadBalanceStrategy 有两个别名，都要列
+            "propertiestransform", "socketfactory", "queryinterceptors",
+            "connectionlifecycleinterceptors", "exceptioninterceptors", "authenticationplugins",
+            "clientinfoprovider", "profilereventhandler", "logger",
+            "serverconfigcachefactory", "parseinfocachefactory", "queryinfocachefactory",
+            "keymanagerfactoryprovider", "trustmanagerfactoryprovider",
+            "ha.loadbalancestrategy", "haloadbalancestrategy", "loadbalanceexceptionchecker",
+            // 凭据有专门的配置项。写进 properties 会被拼进 JDBC URL，
+            // 而这条 URL 会出现在「找不到驱动」的错误日志里
+            "user", "password");
+
+    /**
+     * 不禁止、但启动时要出声的参数。
+     *
+     * <p>这个组合在 MySQL 8 默认的 caching_sha2_password 下允许中间人塞入自己的 RSA 公钥并
+     * 还原出数据库密码——config.yml 的注释一直在劝阻它，却只有劝阻没有提醒。
+     * 不直接拒绝是因为本机非 TLS 的 MySQL 确实可能需要 allowPublicKeyRetrieval。
+     */
+    private static final Set<String> INSECURE_TLS_PROPERTIES = Set.of(
+            "allowpublickeyretrieval", "usessl", "sslmode");
+
+    /**
+     * properties 里不允许出现百分号。
+     *
+     * <p>光有黑名单不够：Connector/J 解析 URL 时会对参数做百分号解码，
+     * {@code %61llowLoadLocalInfile=true} 在 {@link #propertyKeys} 看来是一个叫
+     * {@code %61llowloadlocalinfile} 的参数，不命中名单，却会被驱动还原成真正的那一个。
+     *
+     * <p>只禁这一个字符而不是整体白名单：百分号是唯一的编码入口，禁掉它编码就不成立了；
+     * 而 {@code sessionVariables=sql_mode='...'} 之类带引号、空格的合法参数还能继续用。
+     */
+    private static final char PROPERTY_ENCODING_CHAR = '%';
 
     /**
      * 没显式配置时补上的连接/读超时。
@@ -79,15 +119,21 @@ public final class Database implements AutoCloseable {
     }
 
     private final Backend backend;
+    /** 不安全的 TLS 配置说明，没有则为 null。onEnable 会把它打成启动警告 */
+    private final String tlsWarning;
     private final String url;
     private final String user;
     private final String password;
     private final String table;
 
     private Connection connection;
+    /** {@link #close()} 之后为 true，{@link #execute} 据此拒绝晚到的调用而不是重开连接 */
+    private boolean closed;
 
-    private Database(Backend backend, String url, String user, String password, String table) throws SQLException {
+    private Database(Backend backend, String url, String user, String password, String table,
+                     String tlsWarning) throws SQLException {
         this.backend = backend;
+        this.tlsWarning = tlsWarning;
         this.url = url;
         this.user = user;
         this.password = password;
@@ -95,11 +141,21 @@ public final class Database implements AutoCloseable {
         try {
             Class.forName(backend.driverClass());
         } catch (ClassNotFoundException e) {
+            // 把 URL 一并报出来：管理员排障时能一眼看到实际用的连接串（密码是单独传的，不在里面），
+            // 同时也让 DatabaseConfigTest 能对 create() 这条生产路径断言——URL 拼装的回归
+            // （比如漏掉 withTimeoutDefaults）只在真实网络故障时才有症状，本地无论如何都测不出来
             throw new SQLException("找不到 " + backend + " 的 JDBC 驱动（" + backend.driverClass()
-                    + "），请确认运行在 Paper 服务端上", e);
+                    + "），请确认运行在 Paper 服务端上；连接串为 " + redactSecrets(url), e);
         }
         reconnect();
-        initSchema();
+        try {
+            initSchema();
+        } catch (SQLException | RuntimeException e) {
+            // 建表/迁移失败会让 onEnable 停用插件，但连接已经建立并通过认证了。
+            // 不关的话它会一直挂在数据库的连接表里——管理员每 /reload 一次重试配置就多泄漏一条
+            closeQuietly();
+            throw e;
+        }
     }
 
     /**
@@ -119,7 +175,8 @@ public final class Database implements AutoCloseable {
                 throw new SQLException("无法创建数据目录: " + dataFolder.getAbsolutePath());
             }
             File dbFile = new File(dataFolder, "data.db");
-            return new Database(backend, "jdbc:sqlite:" + dbFile.getAbsolutePath(), null, null, DEFAULT_TABLE);
+            return new Database(backend, "jdbc:sqlite:" + dbFile.getAbsolutePath(),
+                    null, null, DEFAULT_TABLE, null);
         }
 
         ConfigurationSection mysql = storage.getConfigurationSection("mysql");
@@ -149,13 +206,58 @@ public final class Database implements AutoCloseable {
         }
         String properties = mysql.getString("properties", "");
         checkProperties(properties);
-        String url = "jdbc:mysql://" + host + ":" + port + "/" + database
+        String url = buildMysqlUrl(host, port, database, properties);
+        return new Database(backend, url, mysql.getString("user", ""), mysql.getString("password", ""),
+                table, insecureTlsWarning(properties));
+    }
+
+    /**
+     * 拼出 MySQL 的 JDBC URL。三个字段都已经过白名单校验，properties 已过黑名单。
+     *
+     * <p>抽成纯函数是为了能直接断言拼出来的字符串：超时默认值有没有真的注入、分隔符对不对，
+     * 这些只在真实数据库上才看得出问题，而补超时默认值的<b>唯一</b>理由就是防止一次挂住的读
+     * 占着 {@link #execute} 的锁让全服卡在登录上。漏掉这一步在本地是完全没有症状的。
+     */
+    static String buildMysqlUrl(String host, int port, String database, String properties) {
+        return "jdbc:mysql://" + host + ":" + port + "/" + database
                 + "?" + withTimeoutDefaults(properties);
-        return new Database(backend, url, mysql.getString("user", ""), mysql.getString("password", ""), table);
+    }
+
+    /**
+     * 把 URL 里任何形似凭据的参数值抹掉再拿去打日志。
+     *
+     * <p>{@code user}/{@code password} 已经进了黑名单，但 Connector/J 还有
+     * {@code trustCertificateKeyStorePassword} 之类一串带 password 的参数，与其逐个列举，
+     * 不如在输出侧统一按名字兜一层。
+     */
+    static String redactSecrets(String url) {
+        return url.replaceAll("(?i)([?&][^=&]*(?:password|user)[^=&]*=)[^&]*", "$1***");
+    }
+
+    /** 检查出用了不安全的 TLS 配置就返回说明，否则返回 null。包级可见以便测试。 */
+    static String insecureTlsWarning(String properties) {
+        for (String pair : properties.split("&")) {
+            String[] kv = pair.split("=", 2);
+            String key = kv[0].trim().toLowerCase(Locale.ROOT);
+            String value = kv.length > 1 ? kv[1].trim().toLowerCase(Locale.ROOT) : "";
+            if (!INSECURE_TLS_PROPERTIES.contains(key)) {
+                continue;
+            }
+            if (key.equals("allowpublickeyretrieval") && value.equals("true")
+                    || key.equals("usessl") && value.equals("false")
+                    || key.equals("sslmode") && value.equals("disabled")) {
+                return pair.trim();
+            }
+        }
+        return null;
     }
 
     /** properties 是原样拼进 JDBC URL 的，先把已知会造成危害的参数挡掉。 */
     private static void checkProperties(String properties) throws SQLException {
+        if (properties.indexOf(PROPERTY_ENCODING_CHAR) >= 0) {
+            throw new SQLException("storage.mysql.properties 里不允许出现 % —— 驱动会对它做百分号解码，"
+                    + "可以借此绕过下面的参数黑名单，当前配置为: " + properties);
+        }
         for (String key : propertyKeys(properties)) {
             if (BANNED_PROPERTIES.contains(key)) {
                 throw new SQLException("storage.mysql.properties 里不允许出现 " + key
@@ -196,6 +298,11 @@ public final class Database implements AutoCloseable {
         return backend;
     }
 
+    /** @return 不安全 TLS 配置的说明，配置没问题时返回 null */
+    public String tlsWarning() {
+        return tlsWarning;
+    }
+
     private void reconnect() throws SQLException {
         closeQuietly();
         connection = user == null
@@ -228,6 +335,12 @@ public final class Database implements AutoCloseable {
      * 两者都要求第一次已经到达服务端才会发生，新增非幂等语句前请先想清楚这一点。
      */
     private synchronized <T> T execute(SqlAction<T> action) throws SQLException {
+        // 关服时 awaitPendingTasks 只等 2 秒，之后 close() 就跑了；晚到的调用不能因为
+        // connection == null 就重新开一条——那条连接没有任何人会再关，/reload 反复触发
+        // 就是每次泄漏一条，而且它会和新实例的 Database 同时写同一个库
+        if (closed) {
+            throw new SQLException("数据库连接已关闭（插件正在停用）");
+        }
         if (connection == null || connection.isClosed()) {
             reconnect();
         }
@@ -265,6 +378,11 @@ public final class Database implements AutoCloseable {
             // getColumns 的表名和列名都是 LIKE pattern，'_' 是单字符通配符，
             // 而表名允许下划线、列名本身就叫 last_ip，不转义会匹配到别的表/列上去
             String escape = meta.getSearchStringEscape();
+            // catalog 这个参数**不要**转义：JDBC 规范里它是精确名称而不是 LIKE 模式，
+            // 只有 schemaPattern / tableNamePattern / columnNamePattern 才是模式。
+            // 转义过的库名（mc\_auth）在 Connector/J 的等值比较下一条都匹配不到，
+            // 于是每次启动都判为「缺列」，第二次启动 ALTER 就撞 Duplicate column 直接停用插件。
+            // 已在真实 MySQL 8.0.46 + Connector/J 9.2.0 上验证过这两种写法的差别
             try (ResultSet rs = meta.getColumns(conn.getCatalog(), null,
                     escapePattern(table, escape), escapePattern("last_ip", escape))) {
                 return rs.next();
@@ -331,9 +449,14 @@ public final class Database implements AutoCloseable {
         });
     }
 
-    /** 改密码同时清空 last_ip：密码变化后下次进服必须重新输密码，免密会话作废 */
-    public void updatePassword(UUID uuid, String passwordHash) throws SQLException {
-        execute(conn -> {
+    /**
+     * 改密码同时清空 last_ip：密码变化后下次进服必须重新输密码，免密会话作废。
+     *
+     * @return 实际改动的记录数；0 表示这个 UUID 已经没有账号了（多服共用一套库时，
+     *         另一台服务器可能刚把它删掉），调用方必须把 0 当失败处理
+     */
+    public int updatePassword(UUID uuid, String passwordHash) throws SQLException {
+        return execute(conn -> {
             try (PreparedStatement ps = conn.prepareStatement(
                     "UPDATE " + table + " SET password_hash = ?, last_ip = NULL WHERE uuid = ?")) {
                 ps.setString(1, passwordHash);
@@ -360,14 +483,24 @@ public final class Database implements AutoCloseable {
         });
     }
 
-    /** 记录成功登录的时间与来源 IP（IP 用于同 IP 免密登录） */
-    public void updateLastLogin(UUID uuid, String ip) throws SQLException {
-        execute(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "UPDATE " + table + " SET last_login = ?, last_ip = ? WHERE uuid = ?")) {
+    /**
+     * 记录成功登录的时间与来源 IP（IP 用于同 IP 免密登录）。
+     *
+     * <p>带上 {@code expectedHash} 条件：这条 UPDATE 是登录成功后异步补写的，不受 session.busy
+     * 保护，可能在管理员 {@code /xalar passwd} 清空 last_ip <b>之后</b>才落库，把刚作废的免密
+     * 凭据又写回去。加上「密码哈希还是我认证时那个」的条件，改过密码的情况下就匹配不到行，
+     * last_ip 保持清空状态。
+     *
+     * @return 实际改动的行数；0 表示这期间密码被改过或账号被删了，调用方无需处理
+     */
+    public int updateLastLogin(UUID uuid, String ip, String expectedHash) throws SQLException {
+        return execute(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement("UPDATE " + table
+                    + " SET last_login = ?, last_ip = ? WHERE uuid = ? AND password_hash = ?")) {
                 ps.setLong(1, System.currentTimeMillis());
                 ps.setString(2, ip);
                 ps.setString(3, uuid.toString());
+                ps.setString(4, expectedHash);
                 return ps.executeUpdate();
             }
         });
@@ -393,6 +526,7 @@ public final class Database implements AutoCloseable {
 
     @Override
     public synchronized void close() throws SQLException {
+        closed = true;
         if (connection != null) {
             Connection open = connection;
             connection = null;

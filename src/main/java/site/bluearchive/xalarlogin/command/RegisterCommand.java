@@ -96,7 +96,7 @@ public final class RegisterCommand implements CommandExecutor {
             final Database.Account account = existing;
             final SQLException error = failure;
 
-            plugin.getServer().getScheduler().runTask(plugin, () -> {
+            plugin.runOnMain(() -> {
                 session.busy.set(false);
                 if (plugin.sessions().get(uuid) != session || !player.isOnline()
                         || session.phase != Phase.NEED_REGISTER) {
@@ -112,14 +112,18 @@ public final class RegisterCommand implements CommandExecutor {
                         player.sendMessage(plugin.message("db-error"));
                         return;
                     }
-                    session.passwordHash = account.passwordHash();
+                    session.setPasswordHash(account.passwordHash());
                     session.phase = Phase.NEED_LOGIN;
                     player.sendMessage(plugin.message("already-registered"));
                     return;
                 }
-                session.passwordHash = hash;
+                session.setPasswordHash(hash);
                 plugin.sessions().markLoggedIn(player);
-                plugin.throttle().clear(name, ip);
+                // 只清玩家名维度，不要传 ip：离线模式下注册一个新名字是零成本的，
+                // 顺手清掉 IP 计数等于让攻击者随时免费重置 ip-lockout-factor 那道防线
+                // （喷到阈值前一次就注册个一次性账号归零，IP 维度永远不会触发）。
+                // 刚注册的名字本来就没有失败记录，这里清 IP 也没有任何正当理由
+                plugin.throttle().clearName(name);
                 player.sendMessage(plugin.message("register-success"));
             });
         });

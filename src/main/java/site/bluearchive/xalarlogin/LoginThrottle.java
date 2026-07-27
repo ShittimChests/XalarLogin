@@ -27,6 +27,25 @@ public final class LoginThrottle {
     public record Failures(int byName, int byIp) {
     }
 
+    /** 两个维度各自是否越线。只有越线的那个维度该被锁，见 {@link #exceeded}。 */
+    public record Exceeded(boolean byName, boolean byIp) {
+    }
+
+    /**
+     * 阈值判定。放在这里而不是留在命令类里，是因为「两个维度各用各的阈值」是本类的核心契约，
+     * 而命令类依赖 Bukkit、没法脱离服务端测试——判定逻辑跟着它走的话，有人把两个维度改回
+     * 「取最大值套同一个阈值」时不会有任何测试变红，而线上表现是同一个 NAT 出口后面的
+     * 几十个玩家被其中一人的三次手滑一起锁在门外。
+     *
+     * @param maxAttempts 玩家名维度的阈值
+     * @param ipFactor    IP 维度的阈值倍数，IP 阈值 = maxAttempts × ipFactor；0 表示不按 IP 锁定
+     */
+    public static Exceeded exceeded(Failures failures, int maxAttempts, int ipFactor) {
+        return new Exceeded(
+                failures.byName() >= maxAttempts,
+                ipFactor > 0 && failures.byIp() >= (long) maxAttempts * ipFactor);
+    }
+
     private static final class Counter {
         /** 只在主线程读写 */
         private int failures;
@@ -101,6 +120,10 @@ public final class LoginThrottle {
      * {@code LoginCommand} 给保留期设了 60 秒下限。{@code lockout-seconds} 填任何小于 60
      * 的值时，锁定到期后第一次输错就会因为计数还停在阈值上而立刻再锁一轮，无限循环，
      * 玩家实际上每个窗口只剩一次机会。
+     *
+     * <p>{@code lockMillis} 传 0 表示「只归零、不锁定」：{@code lockedUntil == now}，
+     * {@link #remainingLockSeconds} 立刻返回 0。{@code lockout-seconds: 0} 走的就是这条，
+     * 那样玩家能立即重连，且重连后仍有完整次数——不归零的话他每次只剩一次机会。
      */
     private void lock(String key, long now, long lockMillis) {
         if (key == null) {
@@ -112,13 +135,40 @@ public final class LoginThrottle {
         counter.lastTouched = now;
     }
 
-    /** 登录成功，清除该来源的失败记录。 */
-    public void clear(String name, String ip) {
-        for (String key : new String[]{key("n:", name), key("i:", ip)}) {
-            if (key != null) {
-                counters.remove(key);
-            }
-        }
+    /**
+     * 清除某个玩家名的失败记录与锁定（登录成功，或管理员重设了这个账号）。
+     *
+     * @return 是否真的清掉了一条记录；{@code /xalar unlock} 靠它区分「解开了」和「本来就没锁」
+     *
+     * <p><b>只清玩家名维度，这是有意的。</b>IP 计数不能由「有人在这个 IP 上成功登录了」来归零：
+     * 离线模式下注册一个账号零成本，攻击者随时可以注册一个自己的名字、用自己设的密码登录一次，
+     * 把 IP 计数清掉，{@code ip-lockout-factor} 那道防线就形同虚设——喷洒到阈值前一次归零，
+     * IP 维度永远不会触发。
+     *
+     * <p>IP 维度平时只靠两条自愈路径回收：保留期内没有新的失败就当作新的一轮，以及锁定到期时
+     * {@link #lock} 把计数清零。代价是共用出口 IP 的失败会在保留期内累积，这正是 IP 阈值要
+     * 比玩家名阈值宽得多的原因；不想要这层防护的服务器可以把 {@code ip-lockout-factor} 设成 0，
+     * 被误锁时管理员可以用 {@code /xalar unlock} 走 {@link #clearIp} 定向解除。
+     */
+    public boolean clearName(String name) {
+        String key = key("n:", name);
+        return key != null && counters.remove(key) != null;
+    }
+
+    /**
+     * 清除某个 IP 的失败记录与锁定。
+     *
+     * <p><b>只允许管理员显式调用</b>（{@code /xalar unlock}），绝不能挂到登录成功之类的自动路径上
+     * ——那正是 {@link #clearName} 的注释里说的那个洞。
+     *
+     * <p>没有这个出口的话，共用出口 IP 的服务器一旦越线（默认 15 次），同一栋楼的所有人要等锁定
+     * 自然到期才进得来，而管理员手上没有任何定向手段。
+     *
+     * @return 是否真的清掉了一条记录
+     */
+    public boolean clearIp(String ip) {
+        String key = key("i:", ip);
+        return key != null && counters.remove(key) != null;
     }
 
     /** 丢弃既没锁定、又已经过了保留期的条目，避免 map 无上限增长。 */

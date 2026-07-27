@@ -1,6 +1,7 @@
 package site.bluearchive.xalarlogin;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.DisplayName;
@@ -43,8 +44,12 @@ class LoginThrottleTest {
     }
 
     @Test
-    @DisplayName("默认 300 秒锁定同样在到期后归零")
-    void defaultLockoutExpiryResetsCounter() {
+    @DisplayName("默认 300 秒配置下，锁定到期后也重新拿到满额次数")
+    void defaultLockoutGivesFullAttemptsAfterExpiry() {
+        // 诚实说明：这条走的是 purge 那条路——默认配置下保留期恰好等于锁定时长，
+        // 锁到期和 purge 资格同时成立，所以就算删掉 lock() 里的归零它也会通过。
+        // 真正钉住那段归零逻辑的是上面的 lockoutExpiryResetsCounter（保留期长于锁定时长，
+        // purge 帮不上忙）。留着这条是为了钉住默认配置下玩家看到的实际体验。
         LoginThrottle throttle = new LoginThrottle();
         long retention = retentionFor(300);
 
@@ -55,6 +60,46 @@ class LoginThrottleTest {
 
         assertEquals(0, throttle.remainingLockSeconds(NAME, IP, 303_000L));
         assertEquals(1, throttle.recordFailure(NAME, IP, 304_000L, retention).byName());
+    }
+
+    @Test
+    @DisplayName("两个维度各用各的阈值，不是取最大值套同一个")
+    void exceededUsesSeparateThresholds() {
+        // 这是本类存在的理由：合并成 Math.max 套 max-login-attempts 的话，同一个 NAT 出口
+        // 后面几十个玩家会被其中一人的三次手滑一起锁在门外五分钟。
+        int maxAttempts = 3;
+        int ipFactor = 5;   // IP 阈值 = 15
+
+        // 玩家名到 3 次就越线，此时 IP 才 3 次，远没到 15
+        LoginThrottle.Exceeded nameOnly =
+                LoginThrottle.exceeded(new LoginThrottle.Failures(3, 3), maxAttempts, ipFactor);
+        assertTrue(nameOnly.byName());
+        assertFalse(nameOnly.byIp(), "IP 才 3 次，不该跟着被锁——那正是 NAT 误伤");
+
+        // 反过来：某个名字只错了 1 次，但这个出口累计 15 次，只锁 IP
+        LoginThrottle.Exceeded ipOnly =
+                LoginThrottle.exceeded(new LoginThrottle.Failures(1, 15), maxAttempts, ipFactor);
+        assertFalse(ipOnly.byName(), "被 IP 阈值兜住时不该连带把这个玩家名也锁上");
+        assertTrue(ipOnly.byIp());
+
+        // 差一次都不算越线
+        assertFalse(LoginThrottle.exceeded(new LoginThrottle.Failures(2, 14), maxAttempts, ipFactor).byName());
+        assertFalse(LoginThrottle.exceeded(new LoginThrottle.Failures(2, 14), maxAttempts, ipFactor).byIp());
+    }
+
+    @Test
+    @DisplayName("ip-lockout-factor 为 0 表示完全不按 IP 锁定")
+    void ipFactorZeroDisablesIpDimension() {
+        assertFalse(LoginThrottle.exceeded(
+                new LoginThrottle.Failures(0, Integer.MAX_VALUE), 3, 0).byIp());
+    }
+
+    @Test
+    @DisplayName("IP 阈值不会因为配置过大而整数溢出")
+    void ipThresholdDoesNotOverflow() {
+        // maxAttempts × ipFactor 用 int 相乘的话这里会溢出成负数，导致任何失败次数都算越线
+        assertFalse(LoginThrottle.exceeded(
+                new LoginThrottle.Failures(0, 1), Integer.MAX_VALUE, Integer.MAX_VALUE).byIp());
     }
 
     @Test
@@ -114,18 +159,51 @@ class LoginThrottleTest {
     }
 
     @Test
-    @DisplayName("登录成功后 clear 抹掉两个维度")
-    void clearRemovesBothDimensions() {
+    @DisplayName("clearName 只抹玩家名维度，IP 计数必须留着")
+    void clearNameLeavesIpDimensionAlone() {
+        // 离线模式下注册账号零成本：如果成功登录能顺手清掉 IP 计数，攻击者随时可以
+        // 注册一个自己的名字登录一次把它归零，ip-lockout-factor 那道防线就形同虚设。
         LoginThrottle throttle = new LoginThrottle();
         long retention = retentionFor(300);
 
         throttle.recordFailure(NAME, IP, 0L, retention);
         throttle.recordFailure(NAME, IP, 1_000L, retention);
-        throttle.clear(NAME, IP);
+        throttle.clearName(NAME);
 
         LoginThrottle.Failures after = throttle.recordFailure(NAME, IP, 2_000L, retention);
-        assertEquals(1, after.byName());
-        assertEquals(1, after.byIp());
+        assertEquals(1, after.byName(), "玩家名维度应该被清掉，重新从 1 数起");
+        assertEquals(3, after.byIp(), "IP 维度不能被清掉，否则注册一个账号就能重置它");
+    }
+
+    @Test
+    @DisplayName("clearName 解得开玩家名的锁，解不开 IP 的锁")
+    void clearNameOnlyLiftsNameLock() {
+        LoginThrottle throttle = new LoginThrottle();
+        throttle.lockName(NAME, 0L, 300_000L);
+        throttle.lockIp(IP, 0L, 300_000L);
+
+        throttle.clearName(NAME);
+
+        assertEquals(0, throttle.remainingLockSeconds(NAME, null, 0L), "管理员应能立即解除玩家名锁定");
+        assertTrue(throttle.remainingLockSeconds("someone-else", IP, 0L) > 0, "IP 锁定不受影响");
+    }
+
+    @Test
+    @DisplayName("lockMillis 传 0 只归零不锁定（lockout-seconds: 0 走的就是这条）")
+    void zeroLockMillisResetsWithoutLocking() {
+        // 不归零的话计数会一直停在阈值上，玩家每次重连只剩 1 次机会，
+        // 而 config.yml 承诺的是「只踢出、不锁定，重连后仍有完整次数」
+        LoginThrottle throttle = new LoginThrottle();
+        long retention = retentionFor(0);
+
+        for (int i = 1; i <= 3; i++) {
+            throttle.recordFailure(NAME, IP, i * 1_000L, retention);
+        }
+        throttle.lockName(NAME, 3_000L, 0L);
+
+        assertEquals(0, throttle.remainingLockSeconds(NAME, IP, 3_000L), "传 0 不应该产生任何锁定");
+        assertEquals(1, throttle.recordFailure(NAME, IP, 4_000L, retention).byName(),
+                "重连后应重新从 1 数起，而不是接着数到 4 立刻再被踢");
     }
 
     @Test

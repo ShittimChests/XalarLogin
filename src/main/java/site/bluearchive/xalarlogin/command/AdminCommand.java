@@ -20,11 +20,12 @@ import site.bluearchive.xalarlogin.XalarLoginPlugin;
  * <ul>
  *   <li>{@code /xalar unregister <玩家>} —— 删号
  *   <li>{@code /xalar passwd <玩家> <新密码>} —— 直接改密码
+ *   <li>{@code /xalar unlock <玩家名|IP>} —— 解除登录失败锁定
  * </ul>
  */
 public final class AdminCommand implements TabExecutor {
 
-    private static final List<String> SUBCOMMANDS = List.of("unregister", "passwd");
+    private static final List<String> SUBCOMMANDS = List.of("unregister", "passwd", "unlock");
 
     private final XalarLoginPlugin plugin;
 
@@ -43,8 +44,30 @@ public final class AdminCommand implements TabExecutor {
             handlePasswd(sender, args[1], args[2]);
             return true;
         }
+        if (args.length == 2 && args[0].equalsIgnoreCase("unlock")) {
+            handleUnlock(sender, args[1]);
+            return true;
+        }
         sender.sendMessage(plugin.message("admin-usage"));
         return true;
+    }
+
+    /**
+     * 解除登录失败锁定。参数既可以是玩家名也可以是 IP，两个维度都清一遍——
+     * 管理员敲这条命令的时候未必分得清是哪一边被锁上了，而清错维度没有副作用。
+     *
+     * <p>IP 维度平时<b>没有</b>任何自动清除路径（见 {@link site.bluearchive.xalarlogin.LoginThrottle#clearName}），
+     * 这条命令是它唯一的定向出口：共用出口 IP 的服务器被越线锁住时，不必干等锁定到期。
+     */
+    private void handleUnlock(CommandSender sender, String target) {
+        // 两个维度都试着清一遍：管理员未必分得清被锁的是名字还是 IP，而清错维度没有副作用
+        // （键有 "n:" / "i:" 前缀，互不干扰）。区分回显是必要的——不然解错目标时他会以为
+        // 已经生效，而玩家仍然进不来
+        boolean cleared = plugin.throttle().clearName(target);
+        cleared |= plugin.throttle().clearIp(target);
+        sender.sendMessage(cleared
+                ? plugin.message("admin-unlock-success", "{target}", target)
+                : plugin.message("admin-unlock-nothing", "{target}", target));
     }
 
     private void handleUnregister(CommandSender sender, String targetName) {
@@ -54,15 +77,14 @@ public final class AdminCommand implements TabExecutor {
                 deleted = plugin.database().deleteByName(targetName);
             } catch (SQLException e) {
                 plugin.getLogger().severe("删除玩家 " + targetName + " 的账号失败: " + e.getMessage());
-                plugin.getServer().getScheduler().runTask(plugin,
-                        () -> sender.sendMessage(plugin.message("db-error")));
+                plugin.runOnMain(() -> sender.sendMessage(plugin.message("db-error")));
                 return;
             }
 
-            plugin.getServer().getScheduler().runTask(plugin, () -> {
+            plugin.runOnMain(() -> {
                 // 解除锁定放在「找不到记录」之前：离线模式下别人可以拿一个名字反复输错密码把它锁掉，
                 // 而管理员多半正是为了解锁才敲这条命令。放在后面的话，账号已经不存在的名字就解不开了
-                plugin.throttle().clear(targetName, null);
+                plugin.throttle().clearName(targetName);
                 if (deleted == 0) {
                     sender.sendMessage(plugin.message("admin-player-not-found", "{player}", targetName));
                     return;
@@ -70,7 +92,8 @@ public final class AdminCommand implements TabExecutor {
                 // 条数可能大于 1：离线模式下大小写不同的名字是不同 UUID，而删除按名字忽略大小写
                 sender.sendMessage(plugin.message("admin-unregister-success",
                         "{player}", targetName, "{count}", String.valueOf(deleted)));
-                for (Player online : plugin.getServer().getOnlinePlayers()) {
+                // 遍历副本：getOnlinePlayers() 是活视图，kick 会把人从底层列表里摘掉
+                for (Player online : List.copyOf(plugin.getServer().getOnlinePlayers())) {
                     if (online.getName().equalsIgnoreCase(targetName)) {
                         online.kick(plugin.bareMessage("kick-unregistered"));
                     }
@@ -102,18 +125,18 @@ public final class AdminCommand implements TabExecutor {
                 updated = plugin.database().updatePasswordByName(targetName, newHash);
             } catch (SQLException e) {
                 plugin.getLogger().severe("修改玩家 " + targetName + " 的密码失败: " + e.getMessage());
-                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                plugin.runOnMain(() -> {
                     release(claimed);
                     sender.sendMessage(plugin.message("db-error"));
                 });
                 return;
             }
 
-            plugin.getServer().getScheduler().runTask(plugin, () -> {
+            plugin.runOnMain(() -> {
                 release(claimed);
                 // 同 unregister：解锁要在「找不到记录」之前，否则被恶意锁定又没有账号记录的
                 // 名字就解不开了
-                plugin.throttle().clear(targetName, null);
+                plugin.throttle().clearName(targetName);
                 if (updated == 0) {
                     sender.sendMessage(plugin.message("admin-player-not-found", "{player}", targetName));
                     return;
@@ -166,7 +189,7 @@ public final class AdminCommand implements TabExecutor {
             }
             Session session = plugin.sessions().get(online.getUniqueId());
             if (session != null) {
-                session.passwordHash = newHash;
+                session.setPasswordHash(newHash);
             }
             online.sendMessage(plugin.message("admin-passwd-notify"));
         }

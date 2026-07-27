@@ -90,8 +90,12 @@ commands:
 |---|---|
 | `/xalar unregister <玩家名>` | 删除该玩家的账号记录。玩家若在线会被踢出，重新进服后需重新注册 |
 | `/xalar passwd <玩家名> <新密码>` | 直接把该玩家的密码改成新密码。玩家**不需要在线**，也不需要知道旧密码 |
+| `/xalar unlock <玩家名\|IP>` | 解除登录失败锁定。参数填玩家名或 IP 都行，两个维度都会清 |
 
-两条命令的玩家名都不区分大小写，都会解除该玩家的登录失败锁定。
+`unregister` 与 `passwd` 的玩家名都不区分大小写，都会顺带解除该**玩家名**的锁定。
+
+**`unlock`** 是解除 **IP 维度**锁定的唯一手段：IP 计数平时不会因为谁登录成功而清零（理由见「防爆破」一节），
+所以共用出口 IP 的网络被整体锁住时，用它可以立刻放行，不必等锁定自然到期。
 
 **`passwd`** 用于玩家忘记密码——比 `unregister` 更省事，玩家不用重新注册，
 背包、权限之类挂在 UUID 上的东西也不受影响。执行后：
@@ -134,7 +138,7 @@ storage:
 - `host`、`database`、`port` 也会被校验（这三个和 `properties` 一样是拼进 JDBC URL 的，
   不卡住的话 `database: 'xalarlogin?allowLoadLocalInfile=true'` 就能绕过下面那份参数黑名单）。
   IPv6 地址请用方括号包起来，例：`host: '[2001:db8::1]'`
-- 改完 `storage` 段**必须重启服务器**，`/reload` 不会重连数据库
+- 改完 `storage` 段**必须重启服务器**。`/reload` 其实会按新配置重新连接数据库，但配置写错时插件会当场停用，而停用会把所有正在冻结中的未认证玩家断开——有人在线时别用 `/reload` 折腾存储配置
 - 配置写错（库名为空、后端名拼错、连不上）时插件会**直接停用并在控制台说明原因**，
   不会静默退回 SQLite —— 那样会让本该连 MySQL 的服务器悄悄建一个空库，
   表现成「所有人都没注册过」，比直接报错危险得多
@@ -144,8 +148,10 @@ storage:
   网上常见的 `useSSL=false&allowPublicKeyRetrieval=true` 千万别抄：MySQL 8 默认的
   `caching_sha2_password` 认证下，这个组合允许中间人塞入自己的 RSA 公钥，从而还原出你的
   数据库密码。数据库和服务端不在同一台机器上时尤其危险
-- 出于同样的理由，`autoDeserialize`、`allowLoadLocalInfile`、`allowUrlInLocalInfile`、
-  `allowMultiQueries`、`databaseTerm` 这几个参数会被插件直接拒绝并在启动时报错
+- 出于同样的理由，`autoDeserialize`、`allowLoadLocalInfile`、`allowLoadLocalInfileInPath`、
+  `allowUrlInLocalInfile`、`allowMultiQueries`、`databaseTerm`、`propertiesTransform`、
+  `socketFactory`、`queryInterceptors` 这几个参数会被插件直接拒绝并在启动时报错。
+  含百分号（`%`）的 `properties` 也会被拒绝——驱动会对它做解码，否则可以借此绕过上面这份名单
 - 没写 `connectTimeout` / `socketTimeout` 时插件会补上 **5 秒 / 30 秒**。Connector/J 的读超时
   默认不限时，数据库变成网络黑洞（丢包而不是拒连）时一次查询能挂到 TCP 自己放弃为止，期间
   所有人的登录都卡住、关服也得排在它后面。要用别的值就在 `properties` 里显式写
@@ -158,11 +164,11 @@ storage:
 | `storage.mysql.*` | — | MySQL 连接信息，见上一节 |
 | `login-timeout-seconds` | 60 | 进服后多少秒未认证被踢出 |
 | `max-login-attempts` | 3 | 密码错误多少次被踢出并锁定该玩家名 |
-| `lockout-seconds` | 300 | 锁定时长（秒），期间被锁定的玩家名 / IP 无法进服。设为 0 关闭锁定 |
+| `lockout-seconds` | 300 | 锁定时长（秒），期间被锁定的玩家名 / IP 无法进服。设为 0 表示只踢出不锁定（可立即重连，且次数会重新给满）|
 | `ip-lockout-factor` | 5 | IP 维度的锁定阈值 = `max-login-attempts` × 此值。设为 0 表示不按 IP 锁定 |
 | `min-password-length` | 6 | 密码最小长度 |
 | `remind-interval-seconds` | 5 | 未登录时的提示间隔（秒） |
-| `ip-session-enabled` | **false** | 同 IP 免密登录开关，默认关闭，开启前请读下方安全权衡 |
+| `ip-session-enabled` | **false** | 同 IP 免密登录开关，默认关闭，开启前请读下方安全权衡。**从旧版升级请手动改**，见下 |
 | `password-hash-iterations` | 600000 | PBKDF2 迭代次数，越高越难爆破但登录越慢。有效范围 10 万 ~ 1000 万 |
 
 关于 `password-hash-iterations`：迭代次数会写进每条密码哈希里，所以**调整它不会让任何老账号失效** ——
@@ -179,7 +185,12 @@ storage:
 - IP：错 `max-login-attempts × ip-lockout-factor` 次（默认 15）才锁定该地址
 
 **锁定到期后计数归零**，玩家重新拿到完整的 `max-login-attempts` 次机会，不会「一进来输错一次就
-又被锁五分钟」。只有越线的那个维度会被锁：被 IP 阈值兜住时不会连带把玩家名也锁上，反之亦然。
+又被锁五分钟」。`lockout-seconds` 设成 0 时同样会归零，只是不锁定、可以立即重连。
+只有越线的那个维度会被锁：被 IP 阈值兜住时不会连带把玩家名也锁上，反之亦然。
+
+成功登录只清除**该玩家名**的失败记录，不清除 IP 的。离线模式下注册账号是零成本的，如果成功登录
+能清 IP 计数，攻击者随时可以注册一个自己的账号登录一次把它归零，这道防线就没用了。IP 计数靠
+「保留期内没有新失败」和「锁定到期」自行回收。
 
 IP 阈值之所以宽这么多，是因为宿舍、家庭 NAT、运营商 CGNAT 后面往往几十个玩家共用一个出口 IP。
 两个维度共用阈值的话，一个人手滑输错三次就会把同网络的所有人一起锁在门外五分钟。
@@ -194,6 +205,10 @@ IP 阈值之所以宽这么多，是因为宿舍、家庭 NAT、运营商 CGNAT 
 ### 关于同 IP 免密登录的安全权衡
 
 **这个功能默认关闭（`ip-session-enabled: false`），开启前请读完本节。**
+
+> ⚠️ **从旧版本升级的服务器请手动检查这一项。** 它以前的默认值是 `true`，而升级只会覆盖 jar、
+> 不会改你已经存在的 `plugins/XalarLogin/config.yml`。仍然开着的话插件启动时会在控制台打一条
+> 安全警告，看到就去把它改成 `false`。
 
 免密判断依据只有一条：「上次成功登录的 IP == 本次进服 IP」。而离线模式下任何人都能用别人的
 名字进服。两者相加意味着——在网吧、校园网、宿舍、家庭合租、运营商 CGNAT、共用 VPN 出口等

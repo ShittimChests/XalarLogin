@@ -60,7 +60,7 @@ public final class ChangePasswordCommand implements CommandExecutor {
 
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             if (storedHash == null || !PasswordHasher.verify(oldPassword, storedHash)) {
-                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                plugin.runOnMain(() -> {
                     session.busy.set(false);
                     // 和下面的成功分支一样比对会话实例：玩家退服重连后 map 里已是新会话，
                     // 给它发上一次连接的「旧密码错误」是误导
@@ -72,22 +72,24 @@ public final class ChangePasswordCommand implements CommandExecutor {
                 return;
             }
             String newHash = PasswordHasher.hash(newPassword, iterations);
-            boolean saved = true;
+            // 改动行数不能丢：多个服务端共用一套 MySQL 时，这条 UPDATE 可能一行都没匹配上
+            // （另一台服务器刚把这个账号删了）。当成成功回报的话，玩家会看到「密码修改成功」、
+            // 会话缓存也换成新哈希，直到下次进服才发现账号根本不存在
+            int updated = -1;
             try {
-                plugin.database().updatePassword(uuid, newHash);
+                updated = plugin.database().updatePassword(uuid, newHash);
             } catch (SQLException e) {
-                saved = false;
                 plugin.getLogger().severe("修改玩家 " + name + " 密码失败: " + e.getMessage());
             }
-            final boolean ok = saved;
+            final boolean ok = updated > 0;
 
-            plugin.getServer().getScheduler().runTask(plugin, () -> {
+            plugin.runOnMain(() -> {
                 session.busy.set(false);
                 if (plugin.sessions().get(uuid) != session || !player.isOnline()) {
                     return;
                 }
                 if (ok) {
-                    session.passwordHash = newHash;
+                    session.setPasswordHash(newHash);
                     player.sendMessage(plugin.message("changepw-success"));
                 } else {
                     player.sendMessage(plugin.message("db-error"));

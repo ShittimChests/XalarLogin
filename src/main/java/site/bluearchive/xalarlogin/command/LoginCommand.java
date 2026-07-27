@@ -19,6 +19,11 @@ import site.bluearchive.xalarlogin.listener.RestrictionListener;
 /** /a &lt;密码&gt; */
 public final class LoginCommand implements CommandExecutor {
 
+    /** lockout-seconds 的上界（30 天）。见 {@link #handleWrongPassword} 里的溢出说明。 */
+    private static final long MAX_LOCKOUT_SECONDS = 30L * 24 * 3600;
+    /** max-login-attempts 与 ip-lockout-factor 的上界，纯粹用来挡住乘法溢出 */
+    private static final int MAX_ATTEMPTS = 1_000_000;
+
     private final XalarLoginPlugin plugin;
 
     public LoginCommand(XalarLoginPlugin plugin) {
@@ -73,7 +78,7 @@ public final class LoginCommand implements CommandExecutor {
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             boolean ok = storedHash != null && PasswordHasher.verify(password, storedHash);
 
-            plugin.getServer().getScheduler().runTask(plugin, () -> {
+            plugin.runOnMain(() -> {
                 session.busy.set(false);
                 if (plugin.sessions().get(uuid) != session || !player.isOnline()
                         || session.phase != Phase.NEED_LOGIN) {
@@ -81,11 +86,11 @@ public final class LoginCommand implements CommandExecutor {
                 }
                 if (ok) {
                     plugin.sessions().markLoggedIn(player);
-                    plugin.throttle().clear(name, ip);
+                    plugin.throttle().clearName(name);
                     player.sendMessage(plugin.message("login-success"));
                     plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
                         try {
-                            plugin.database().updateLastLogin(uuid, ip);
+                            plugin.database().updateLastLogin(uuid, ip, storedHash);
                         } catch (SQLException e) {
                             plugin.getLogger().warning("更新玩家 " + name + " 登录时间失败: " + e.getMessage());
                         }
@@ -98,11 +103,27 @@ public final class LoginCommand implements CommandExecutor {
         return true;
     }
 
+    /**
+     * 锁定要留痕：被锁的 IP 只在这里出现过一次，不记的话管理员根本不知道该给
+     * {@code /xalar unlock} 传什么——被锁的人已经连不进来，Tab 补全也列不出他们。
+     */
+    private void logLock(String what, long seconds) {
+        plugin.getLogger().warning("登录失败次数超限，已锁定 " + what + " " + seconds
+                + " 秒；如需提前解除：/xalar unlock <玩家名|IP>");
+    }
+
     /** 失败计数记在 LoginThrottle 而非 Session 上，这样踢出后重连也不会清零。 */
     private void handleWrongPassword(Player player, String name, String ip) {
-        int maxAttempts = Math.max(1, plugin.getConfig().getInt("max-login-attempts", 3));
-        long lockoutSeconds = Math.max(0, plugin.getConfig().getLong("lockout-seconds", 300));
-        int ipFactor = Math.max(0, plugin.getConfig().getInt("ip-lockout-factor", 5));
+        // 三个旋钮都要双侧钳：下面 maxAttempts × ipFactor 与 lockoutSeconds × 1000
+        // 都会做乘法，只钳下界的话配置里填个极大值就会溢出，锁定反而彻底失效
+        int maxAttempts = Math.clamp(plugin.getConfig().getInt("max-login-attempts", 3),
+                1, MAX_ATTEMPTS);
+        // 上界必须钳：下面要乘 1000 变成毫秒，配置里填个很大的数会溢出成负数，
+        // lockedUntil = now + 负数 → remainingLockSeconds 立刻返回 0，锁定彻底失效。
+        // 30 天足够覆盖任何合理用法，超出的按 30 天算
+        long lockoutSeconds = Math.clamp(plugin.getConfig().getLong("lockout-seconds", 300),
+                0L, MAX_LOCKOUT_SECONDS);
+        int ipFactor = Math.clamp(plugin.getConfig().getInt("ip-lockout-factor", 5), 0, MAX_ATTEMPTS);
         long now = System.currentTimeMillis();
         // 保留期只负责「一轮没打满就长时间没动静，当作新的一轮」。锁定到期后的归零不靠它，
         // 由 LoginThrottle.lock() 直接把计数清掉——否则这里的 60 秒下限会在
@@ -110,27 +131,31 @@ public final class LoginCommand implements CommandExecutor {
         long retentionMillis = Math.max(lockoutSeconds, 60L) * 1000L;
 
         LoginThrottle.Failures failures = plugin.throttle().recordFailure(name, ip, now, retentionMillis);
-        boolean nameExceeded = failures.byName() >= maxAttempts;
         // IP 维度用高得多的阈值：宿舍、家庭 NAT、运营商 CGNAT 后面几十个玩家共用一个出口 IP，
         // 跟玩家名共用阈值的话，一个人输错三次就把所有人锁在门外五分钟。
-        boolean ipExceeded = ipFactor > 0 && failures.byIp() >= (long) maxAttempts * ipFactor;
+        // 判定本身在 LoginThrottle 里，那样才测得到，别挪回来
+        LoginThrottle.Exceeded exceeded = LoginThrottle.exceeded(failures, maxAttempts, ipFactor);
 
-        if (!nameExceeded && !ipExceeded) {
+        if (!exceeded.byName() && !exceeded.byIp()) {
             player.sendMessage(plugin.message("wrong-password",
                     "{remaining}", String.valueOf(maxAttempts - failures.byName())));
             return;
         }
-        if (lockoutSeconds > 0) {
-            // 只锁真正越线的那个维度：被 IP 阈值兜住时不该连带把这个玩家名也锁上
-            if (nameExceeded) {
-                plugin.throttle().lockName(name, now, lockoutSeconds * 1000L);
-            }
-            if (ipExceeded) {
-                plugin.throttle().lockIp(ip, now, lockoutSeconds * 1000L);
-            }
-            player.kick(plugin.bareMessage("kick-locked-out", "{seconds}", String.valueOf(lockoutSeconds)));
-        } else {
-            player.kick(plugin.bareMessage("kick-too-many-attempts"));
+        // 越线的那个维度到此结束一轮，计数必须归零，否则它会一直停在阈值上，玩家每次重连
+        // 只剩一次机会。lockMillis 传 0 就是「只归零、不锁定」（lockedUntil == now，
+        // remainingLockSeconds 立刻返回 0），lockout-seconds: 0 那条路径要的正是这个。
+        // 只处理真正越线的那个维度：被 IP 阈值兜住时不该连带把这个玩家名也锁上
+        long lockMillis = lockoutSeconds * 1000L;
+        if (exceeded.byName()) {
+            plugin.throttle().lockName(name, now, lockMillis);
+            logLock("玩家名 " + name, lockoutSeconds);
         }
+        if (exceeded.byIp()) {
+            plugin.throttle().lockIp(ip, now, lockMillis);
+            logLock("IP " + ip, lockoutSeconds);
+        }
+        player.kick(lockoutSeconds > 0
+                ? plugin.bareMessage("kick-locked-out", "{seconds}", String.valueOf(lockoutSeconds))
+                : plugin.bareMessage("kick-too-many-attempts"));
     }
 }
