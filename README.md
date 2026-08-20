@@ -240,3 +240,9 @@ mvn package
 ```
 
 产物：`target/XalarLogin-1.0.0.jar`。唯一依赖 `paper-api`（provided），无需 shade。
+
+---
+
+### License
+
+AAR
